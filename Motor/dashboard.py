@@ -1,1394 +1,617 @@
-import time
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from config import LOG_DIR, RESULTS_DIR
+from config import LOG_DIR
+
+
+BASE_DIR = Path(__file__).resolve().parent
+ARTIFACT_DIR = BASE_DIR / "artifacts" / "final_ddim20"
+SUMMARY_DIR = ARTIFACT_DIR / "summary"
+MODEL_DIR = ARTIFACT_DIR / "models"
 
 
 st.set_page_config(
-    page_title="Adaptive PID Dashboard",
+    page_title="Diffusion Gain-Chunk Control",
+    page_icon="DC",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.title("Adaptive PID Dashboard")
 
-SUMMARY_DIR = RESULTS_DIR / "summary"
-KAFKA_CONTROL_DIR = RESULTS_DIR / "kafka_control"
+def inject_css():
+    st.markdown(
+        """
+        <style>
+        :root {
+            --ink: #172033;
+            --muted: #667085;
+            --line: #d9dee8;
+            --panel: #f7f8fb;
+            --accent: #ea6a2a;
+            --accent-soft: #fff1e8;
+            --blue: #18277a;
+            --blue-soft: #eef1ff;
+            --green: #16865a;
+        }
+        .block-container {
+            padding-top: 1.8rem;
+            padding-bottom: 3rem;
+            max-width: 1480px;
+        }
+        h1, h2, h3 {
+            letter-spacing: 0;
+            color: var(--ink);
+        }
+        h1 {
+            font-size: 2.05rem !important;
+            margin-bottom: 0.25rem !important;
+        }
+        h2 {
+            font-size: 1.35rem !important;
+            margin-top: 1.2rem !important;
+        }
+        h3 {
+            font-size: 1.05rem !important;
+        }
+        .hero {
+            border: 1px solid var(--line);
+            background: linear-gradient(180deg, #ffffff 0%, #f7f8fb 100%);
+            padding: 1.1rem 1.25rem;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }
+        .hero-title {
+            font-size: 1.9rem;
+            font-weight: 760;
+            color: var(--ink);
+            margin: 0;
+        }
+        .hero-subtitle {
+            color: var(--muted);
+            margin-top: 0.25rem;
+            font-size: 0.98rem;
+        }
+        .pill-row {
+            display: flex;
+            gap: 0.45rem;
+            flex-wrap: wrap;
+            margin-top: 0.85rem;
+        }
+        .pill {
+            border: 1px solid #f0c6ac;
+            background: var(--accent-soft);
+            color: #9b3d0f;
+            border-radius: 999px;
+            padding: 0.22rem 0.6rem;
+            font-size: 0.78rem;
+            font-weight: 650;
+        }
+        .note {
+            border-left: 4px solid var(--accent);
+            padding: 0.65rem 0.8rem;
+            background: #fff8f4;
+            color: #4c2a17;
+            border-radius: 4px;
+            font-size: 0.9rem;
+        }
+        .section-caption {
+            color: var(--muted);
+            font-size: 0.9rem;
+            margin-top: -0.2rem;
+            margin-bottom: 0.75rem;
+        }
+        div[data-testid="stMetric"] {
+            border: 1px solid var(--line);
+            background: #ffffff;
+            border-radius: 8px;
+            padding: 0.7rem 0.85rem;
+        }
+        div[data-testid="stMetric"] label {
+            color: var(--muted) !important;
+            font-size: 0.78rem !important;
+        }
+        div[data-testid="stMetricValue"] {
+            color: var(--ink) !important;
+            font-size: 1.35rem !important;
+        }
+        .stDataFrame {
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def read_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_csv(path)
+
+
+def fmt(value, digits=2, suffix=""):
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{float(value):.{digits}f}{suffix}"
+
+
+def find_file(pattern: str) -> Path | None:
+    files = sorted(SUMMARY_DIR.glob(pattern))
+    return files[-1] if files else None
+
+
+def final_model_path() -> Path:
+    return MODEL_DIR / (
+        "diffusion_gain_chunk_unet_balanced1000_global_topk_full_"
+        "20260508_193250.joblib"
+    )
+
+
+def style_numeric(df: pd.DataFrame):
+    numeric_cols = df.select_dtypes(include="number").columns
+    return df.style.format({col: "{:.3f}" for col in numeric_cols})
+
+
+def metric_row(items):
+    cols = st.columns(len(items))
+    for col, item in zip(cols, items):
+        label, value, suffix = item
+        col.metric(label, fmt(value, suffix=suffix))
+
+
+def compact_method_name(name: str) -> str:
+    return (
+        str(name)
+        .replace("Full_Diffusion_", "")
+        .replace("_5run", "")
+        .replace("_", " ")
+    )
+
+
+def method_order_key(name: str) -> int:
+    text = str(name)
+    for idx, token in enumerate(["DDIM20", "DDIM30", "DDIM40", "DDIM50"]):
+        if token in text:
+            return idx
+    return 99
 
 
 def get_latest_file(directory: Path, pattern: str):
     files = sorted(directory.glob(pattern), key=lambda path: path.stat().st_mtime)
-    if not files:
-        return None
-    return files[-1]
-
-
-def read_csv_if_exists(path: Path | None):
-    if path is None:
-        return None
-    try:
-        return pd.read_csv(path)
-    except Exception as exc:
-        st.warning(f"Failed to read {path.name}: {exc}")
-        return None
-
-
-def metric_value(df: pd.DataFrame, column: str):
-    if df is None or df.empty or column not in df.columns:
-        return None
-    value = df[column].iloc[0]
-    if pd.isna(value):
-        return None
-    return float(value)
-
-
-def show_metric_cards(df: pd.DataFrame, specs):
-    cols = st.columns(len(specs))
-    for col, (label, column, suffix) in zip(cols, specs):
-        value = metric_value(df, column)
-        text = "-" if value is None else f"{value:.4f}{suffix}"
-        col.metric(label, text)
-
-
-def select_columns(df: pd.DataFrame, columns):
-    if df is None:
-        return None
-    return df[[col for col in columns if col in df.columns]]
-
-
-def pretty_dataframe(df: pd.DataFrame):
-    numeric_cols = df.select_dtypes(include="number").columns
-    return df.style.format({col: "{:.4f}" for col in numeric_cols})
-
-
-def metrics_to_log_path(metrics_file: str):
-    log_name = metrics_file.replace(
-        "local_kafka_controller_metrics_", "local_kafka_controller_log_", 1
-    )
-    return KAFKA_CONTROL_DIR / log_name
-
-
-def representative_metrics_row(raw_df: pd.DataFrame, scenario: str, method: str):
-    subset = raw_df[
-        raw_df["scenario"].eq(scenario) & raw_df["method"].eq(method)
-    ].copy()
-    if subset.empty or "IAE" not in subset.columns:
-        return None
-    mean_iae = subset["IAE"].mean()
-    subset["_distance_to_mean_IAE"] = (subset["IAE"] - mean_iae).abs()
-    return subset.sort_values("_distance_to_mean_IAE").iloc[0]
-
-
-def load_representative_log(raw_df: pd.DataFrame, scenario: str, method: str):
-    row = representative_metrics_row(raw_df, scenario, method)
-    if row is None or "metrics_file" not in row:
-        return None, None
-    log_path = metrics_to_log_path(str(row["metrics_file"]))
-    if not log_path.exists():
-        return row, None
-    return row, read_csv_if_exists(log_path)
-
-
-def comparison_series(left_df: pd.DataFrame, right_df: pd.DataFrame, columns):
-    frames = []
-    for label, df in [("Direct", left_df), ("MT-DL", right_df)]:
-        if df is None or "time" not in df.columns:
-            continue
-        available = [col for col in columns if col in df.columns]
-        if not available:
-            continue
-        sub = df[["time", *available]].copy()
-        sub = sub.set_index("time")
-        sub = sub.rename(columns={col: f"{label} {col}" for col in available})
-        frames.append(sub)
-    if not frames:
-        return None
-    return pd.concat(frames, axis=1).sort_index()
-
-
-def comparison_series_named(series_specs, columns):
-    frames = []
-    for label, df in series_specs:
-        if df is None or "time" not in df.columns:
-            continue
-        available = [col for col in columns if col in df.columns]
-        if not available:
-            continue
-        sub = df[["time", *available]].copy()
-        sub = sub.set_index("time")
-        sub = sub.rename(columns={col: f"{label} {col}" for col in available})
-        frames.append(sub)
-    if not frames:
-        return None
-    return pd.concat(frames, axis=1).sort_index()
-
-
-def representative_row_by_iae(df: pd.DataFrame):
-    if df is None or df.empty or "IAE" not in df.columns:
-        return None
-    data = df.copy()
-    mean_iae = pd.to_numeric(data["IAE"], errors="coerce").mean()
-    data["_distance_to_mean_IAE"] = (
-        pd.to_numeric(data["IAE"], errors="coerce") - mean_iae
-    ).abs()
-    return data.sort_values("_distance_to_mean_IAE").iloc[0]
-
-
-def load_log_from_metrics_name(metrics_file):
-    if metrics_file is None or pd.isna(metrics_file):
-        return None
-    path = metrics_to_log_path(str(metrics_file))
-    if not path.exists():
-        return None
-    return read_csv_if_exists(path)
-
-
-def clean_final_row(final_df: pd.DataFrame, scenario: str, method: str):
-    if final_df is None:
-        return None
-    subset = final_df[
-        final_df["scenario"].eq(scenario) & final_df["method"].eq(method)
-    ]
-    if subset.empty:
-        return None
-    return subset.iloc[0]
-
-
-def make_ablation_summary():
-    rows = [
-        {
-            "stage": "Clean Direct MLP",
-            "intent": "State-to-gain supervised baseline",
-            "outcome": "Strong baseline, but not trajectory-objective trained",
-            "decision": "Reference baseline",
-        },
-        {
-            "stage": "IAE/PWM label weighting",
-            "intent": "Prefer lower IAE and weaker PWM use during label selection",
-            "outcome": "Did not beat clean Direct in real control",
-            "decision": "Rejected",
-        },
-        {
-            "stage": "DB-reference / residual DB",
-            "intent": "Inject discrete gain DB prior into the policy",
-            "outcome": "Discrete prior alone did not improve closed-loop IAE",
-            "decision": "Rejected",
-        },
-        {
-            "stage": "Rank-weighted labels",
-            "intent": "Use multiple top candidates per context instead of best-1 labels",
-            "outcome": "Offline gain MAE improved, real IAE did not",
-            "decision": "Rejected",
-        },
-        {
-            "stage": "Surrogate-objective V1",
-            "intent": "Train Direct policy through frozen MT-DL horizon IAE objective",
-            "outcome": "Won 4/4 baseline scenarios in 5-repeat validation",
-            "decision": "Selected",
-        },
-        {
-            "stage": "Surrogate-objective V2 PWM penalty",
-            "intent": "Reduce peak PWM while keeping V1 IAE benefit",
-            "outcome": "Average IAE and max PWM did not improve over V1",
-            "decision": "Rejected",
-        },
-    ]
-    return pd.DataFrame(rows)
+    return files[-1] if files else None
 
 
 def get_latest_log_file():
-    log_files = sorted(LOG_DIR.glob("*.csv"))
-
-    if not log_files:
+    if not LOG_DIR.exists():
         return None
+    return get_latest_file(LOG_DIR, "*.csv")
 
-    return log_files[-1]
 
+inject_css()
 
-refresh_interval = st.sidebar.slider(
-    "Refresh interval [s]",
-    min_value=0.5,
-    max_value=5.0,
-    value=1.0,
-    step=0.5,
+comparison_path = find_file("full_diffusion_ddim20_30_40_50_comparison_*.csv")
+repeats_path = find_file("full_diffusion_ddim20_5run_repeats_*.csv")
+segment_path = find_file("full_diffusion_ddim20_30_50_segment_compare_*.csv")
+gain_path = find_file("full_diffusion_ddim20_30_50_decel_gain_compare_*.csv")
+light_path = find_file("light32_ddim20_after_isaac_off_5run_summary_*.csv")
+bench_path = find_file("diffusion_unet_lightweight_ddim20_inference_benchmark_*.csv")
+
+comparison_df = read_csv(comparison_path) if comparison_path else pd.DataFrame()
+repeats_df = read_csv(repeats_path) if repeats_path else pd.DataFrame()
+segment_df = read_csv(segment_path) if segment_path else pd.DataFrame()
+gain_df = read_csv(gain_path) if gain_path else pd.DataFrame()
+light_df = read_csv(light_path) if light_path else pd.DataFrame()
+bench_df = read_csv(bench_path) if bench_path else pd.DataFrame()
+
+st.markdown(
+    """
+    <div class="hero">
+      <div class="hero-title">Diffusion-Based PID Gain Chunk Scheduler</div>
+      <div class="hero-subtitle">
+        Real-motor validation of asynchronous server-assisted gain scheduling
+        with a DDIM20 diffusion U-Net.
+      </div>
+      <div class="pill-row">
+        <span class="pill">ESP32 local PID</span>
+        <span class="pill">Kafka async schedule</span>
+        <span class="pill">20-step gain chunk</span>
+        <span class="pill">2.0 s horizon</span>
+        <span class="pill">DDIM20 selected</span>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
-auto_refresh = st.sidebar.checkbox("Auto refresh realtime tab", value=True)
+st.sidebar.header("Final Study")
+st.sidebar.caption("Artifact-backed dashboard")
+st.sidebar.write(f"`{ARTIFACT_DIR.relative_to(BASE_DIR)}`")
+st.sidebar.divider()
+st.sidebar.markdown("**Scenario**")
+st.sidebar.write("70 -> 95 -> 90 -> 73 RPM")
+st.sidebar.write("Changes: 5, 10, 15 s")
+st.sidebar.divider()
+st.sidebar.markdown("**Selected Model**")
+st.sidebar.write("Full Diffusion U-Net")
+st.sidebar.write("DDIM steps: 20")
+st.sidebar.write("Chunk: 20 x 0.1 s")
 
-realtime_tab, results_tab, logs_tab = st.tabs(
-    ["Realtime Monitor", "Experiment Results", "Kafka Logs"]
+overview_tab, performance_tab, chunks_tab, realtime_tab, artifacts_tab = st.tabs(
+    [
+        "Overview",
+        "Performance",
+        "Gain Chunk Behavior",
+        "Realtime Monitor",
+        "Artifacts",
+    ]
 )
 
-with realtime_tab:
-    log_file = get_latest_log_file()
+with overview_tab:
+    st.subheader("Selected Result")
+    st.markdown(
+        '<div class="section-caption">Final method selected from DDIM step and lightweight ablations.</div>',
+        unsafe_allow_html=True,
+    )
 
-    if log_file is None:
-        st.warning("No realtime log file found.")
+    if comparison_df.empty:
+        st.warning("Final comparison CSV was not found.")
     else:
-        st.caption(f"Current log file: {log_file}")
-
-        try:
-            df = pd.read_csv(log_file)
-        except Exception as e:
-            st.error(f"Failed to read log file: {e}")
-            df = pd.DataFrame()
-
-        if len(df) == 0:
-            st.warning("Log file is empty.")
-        else:
-            latest = df.iloc[-1]
-
-            mode = latest["mode"] if "mode" in df.columns else "unknown"
-            env_type = latest["env_type"] if "env_type" in df.columns else "unknown"
-
-            st.caption(f"Mode: {mode} | Environment: {env_type}")
-
-            col1, col2, col3, col4 = st.columns(4)
-
-            col1.metric("Target", f"{latest['target']:.2f}")
-            col2.metric("Current", f"{latest['current']:.2f}")
-            col3.metric("Error", f"{latest['error']:.2f}")
-            col4.metric("PWM", f"{latest['pwm']:.2f}")
-
-            col5, col6, col7 = st.columns(3)
-
-            col5.metric("Kp", f"{latest['kp']:.3f}")
-            col6.metric("Ki", f"{latest['ki']:.3f}")
-            col7.metric("Kd", f"{latest['kd']:.3f}")
-
-            col8, col9, col10 = st.columns(3)
-
-            if "pwm_saturated" in df.columns:
-                col8.metric("PWM Saturated", str(latest["pwm_saturated"]))
-
-            if "high_saturation" in df.columns:
-                col9.metric("High Saturation", str(latest["high_saturation"]))
-
-            if "gain_update_flag" in df.columns:
-                col10.metric("Gain Updated", str(latest["gain_update_flag"]))
-
-            col11, col12 = st.columns(2)
-
-            if "integral" in df.columns:
-                col11.metric("Integral", f"{latest['integral']:.3f}")
-
-            if "prev_pwm" in df.columns:
-                col12.metric("Previous PWM", f"{latest['prev_pwm']:.2f}")
-
-            if "time" in df.columns:
-                time_df = df.set_index("time")
-
-                if "integral" in df.columns:
-                    st.subheader("Integral Term")
-                    st.line_chart(time_df[["integral"]])
-
-                if "gain_update_flag" in df.columns:
-                    st.subheader("Gain Update Flag")
-                    st.line_chart(time_df[["gain_update_flag"]])
-
-                sat_cols = [
-                    col
-                    for col in ["pwm_saturated", "high_saturation", "low_saturation"]
-                    if col in df.columns
-                ]
-                if sat_cols:
-                    st.subheader("PWM Saturation")
-                    st.line_chart(time_df[sat_cols])
-
-                st.subheader("Target vs Current")
-                st.line_chart(time_df[["target", "current"]])
-
-                st.subheader("PWM Output")
-                st.line_chart(time_df[["pwm"]])
-
-                st.subheader("PID Gains")
-                st.line_chart(time_df[["kp", "ki", "kd"]])
-
-            st.subheader("Latest Data")
-            st.dataframe(df.tail(20), use_container_width=True)
-
-with results_tab:
-    st.subheader("Current Recommended Setting")
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Policy", "Direct MLP")
-    col2.metric("Inference Delay", "0.5 s")
-    col3.metric("Chunk Horizon", "20 steps")
-    col4.metric("Chunk Duration", "2.0 s")
-
-    st.caption(
-        "Dynamic scenario used for timing ablation: 70 -> 95 -> 90 -> 73 rpm."
-    )
-
-    st.markdown("**Research Result Snapshot**")
-    st.caption(
-        "Current best policy: Surrogate-Objective Direct MLP v1 "
-        "(model id 20260502_153840). The policy is trained through a frozen "
-        "MT-DL horizon model, but online inference uses only the Direct MLP."
-    )
-
-    final5_model_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_v1_final5_validation_model_summary_*.csv"
-    )
-    final5_model_df = read_csv_if_exists(final5_model_path)
-    if final5_model_df is not None and not final5_model_df.empty:
-        show_metric_cards(
-            final5_model_df,
+        final_row = comparison_df[
+            comparison_df["method"].eq("Full_Diffusion_DDIM20_5run")
+        ].iloc[0]
+        metric_row(
             [
-                ("Final Runs", "runs", ""),
-                ("Scenario Mean IAE", "IAE_mean", ""),
-                ("After-change IAE", "after_change_IAE_mean", ""),
-                ("Mean Max PWM", "max_pwm_mean", ""),
-            ],
+                ("IAE", final_row.get("IAE_mean"), ""),
+                ("After-change IAE", final_row.get("after_change_IAE_mean"), ""),
+                ("Generator p90", final_row.get("latency_generator_duration_sec_p90_mean"), " s"),
+                ("Source-to-apply p90", final_row.get("latency_source_to_apply_sec_p90_mean"), " s"),
+            ]
         )
 
-    st.markdown("**Model Structure**")
+        st.markdown("")
+        st.markdown(
+            """
+            <div class="note">
+            The PC/Kafka server does not compute PWM at every control step.
+            It asynchronously publishes future PID gain chunks, while the ESP32
+            keeps the low-level PID loop local and continues with the latest
+            valid gain schedule when communication is delayed.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.subheader("Control Architecture")
+    arch_cols = st.columns([1.0, 1.0, 1.0, 1.0])
+    arch_cols[0].markdown("**1. Local State**")
+    arch_cols[0].write("Encoder RPM, target, error, PWM, PID terms, and recent history are published as `motor_state`.")
+    arch_cols[1].markdown("**2. Diffusion Policy**")
+    arch_cols[1].write("A conditional U-Net denoises a 20-step `[Kp, Ki, Kd]` chunk using DDIM20.")
+    arch_cols[2].markdown("**3. Schedule Buffer**")
+    arch_cols[2].write("Kafka-delivered chunks are inserted into a delay-aware FIFO schedule.")
+    arch_cols[3].markdown("**4. ESP32 PID**")
+    arch_cols[3].write("The local controller applies time-varying gains while preserving real-time PWM control.")
+
+    st.subheader("Runtime Configuration")
+    config_df = pd.DataFrame(
+        [
+            ["Final generator", "Conditional diffusion U-Net"],
+            ["Sampler", "DDIM20"],
+            ["Chunk horizon", "20 steps / 2.0 s"],
+            ["Step interval", "0.1 s"],
+            ["Inference delay assumption", "0.5 s"],
+            ["Validation target sequence", "70 -> 95 -> 90 -> 73 RPM"],
+            ["Kafka topics", "motor_state, motor_schedule_chunk, motor_gain_command"],
+        ],
+        columns=["Item", "Value"],
+    )
+    st.dataframe(config_df, hide_index=True, use_container_width=True)
+
+with performance_tab:
+    st.subheader("DDIM Step Ablation")
+    st.markdown(
+        '<div class="section-caption">Full diffusion model tested on the same real-motor transition scenario.</div>',
+        unsafe_allow_html=True,
+    )
+
+    if comparison_df.empty:
+        st.warning("No comparison data available.")
+    else:
+        display = comparison_df.copy()
+        display["label"] = display["method"].map(compact_method_name)
+        display = display.sort_values("method", key=lambda col: col.map(method_order_key))
+
+        metric_cols = [
+            "label",
+            "runs",
+            "IAE_mean",
+            "IAE_std",
+            "after_change_IAE_mean",
+            "after_change_IAE_std",
+            "mean_pwm_mean",
+            "max_pwm_mean",
+            "schedule_chunk_accepted_count_mean",
+            "schedule_gain_applied_count_mean",
+            "schedule_fallback_count_mean",
+            "latency_generator_duration_sec_p90_mean",
+            "latency_source_to_apply_sec_p90_mean",
+        ]
+        st.dataframe(
+            style_numeric(display[[c for c in metric_cols if c in display.columns]]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        chart_df = display.set_index("label")
+        c1, c2 = st.columns(2)
+        c1.markdown("**Tracking Error**")
+        c1.bar_chart(chart_df[["IAE_mean", "after_change_IAE_mean"]])
+        c2.markdown("**Timing**")
+        c2.bar_chart(
+            chart_df[
+                [
+                    "latency_generator_duration_sec_p90_mean",
+                    "latency_source_to_apply_sec_p90_mean",
+                ]
+            ]
+        )
+
+    st.subheader("Lightweight Model Check")
+    st.markdown(
+        '<div class="section-caption">Model-size reduction was evaluated after the final DDIM20 result.</div>',
+        unsafe_allow_html=True,
+    )
+    c1, c2 = st.columns(2)
+    if not light_df.empty:
+        light_row = light_df.iloc[0]
+        light_summary = pd.DataFrame(
+            [
+                {
+                    "method": "Light32 DDIM20",
+                    "runs": light_row.get("runs"),
+                    "IAE_mean": light_row.get("IAE_mean"),
+                    "after_change_IAE_mean": light_row.get("after_change_IAE_mean"),
+                    "mean_pwm_mean": light_row.get("mean_pwm_mean"),
+                    "generator_p90_mean": light_row.get(
+                        "latency_generator_duration_sec_p90_mean"
+                    ),
+                    "source_to_apply_p90_mean": light_row.get(
+                        "latency_source_to_apply_sec_p90_mean"
+                    ),
+                }
+            ]
+        )
+        c1.dataframe(style_numeric(light_summary), use_container_width=True, hide_index=True)
+    else:
+        c1.info("No light32 real-motor summary found.")
+
+    if not bench_df.empty:
+        bench_show = bench_df[["model", "mean_sec", "p50_sec", "p90_sec", "max_sec"]]
+        c2.dataframe(style_numeric(bench_show), use_container_width=True, hide_index=True)
+        c2.bar_chart(bench_df.set_index("model")[["p90_sec"]])
+    else:
+        c2.info("No inference benchmark found.")
+
+    st.subheader("Repeat-Level Stability")
+    if not repeats_df.empty:
+        repeat_cols = [
+            "method",
+            "IAE",
+            "after_change_IAE",
+            "mean_pwm",
+            "max_pwm",
+            "schedule_chunk_accepted_count",
+            "schedule_gain_applied_count",
+            "latency_generator_duration_sec_p90",
+            "latency_source_to_apply_sec_p90",
+        ]
+        st.dataframe(
+            style_numeric(repeats_df[[c for c in repeat_cols if c in repeats_df.columns]]),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("Repeat-level file is not available.")
+
+with chunks_tab:
+    st.subheader("Segment-Level Behavior")
+    st.markdown(
+        '<div class="section-caption">How the selected method allocates gains and PWM across target transitions.</div>',
+        unsafe_allow_html=True,
+    )
+
+    if segment_df.empty:
+        st.warning("No segment comparison data available.")
+    else:
+        selected_methods = st.multiselect(
+            "Methods",
+            options=sorted(segment_df["method"].unique()),
+            default=["Full_Diffusion_DDIM20"],
+        )
+        seg = segment_df[segment_df["method"].isin(selected_methods)].copy()
+        seg_mean = (
+            seg.groupby(["method", "segment"], as_index=False)
+            .agg(
+                IAE=("IAE", "mean"),
+                mean_pwm=("mean_pwm", "mean"),
+                kp_mean=("kp_mean", "mean"),
+                ki_mean=("ki_mean", "mean"),
+                kd_mean=("kd_mean", "mean"),
+            )
+        )
+        st.dataframe(style_numeric(seg_mean), hide_index=True, use_container_width=True)
+
+        c1, c2 = st.columns(2)
+        if not seg_mean.empty:
+            c1.markdown("**Segment IAE**")
+            c1.bar_chart(seg_mean.pivot(index="segment", columns="method", values="IAE"))
+            c2.markdown("**Segment Mean PWM**")
+            c2.bar_chart(
+                seg_mean.pivot(index="segment", columns="method", values="mean_pwm")
+            )
+
+        st.markdown("**Mean Gain by Segment**")
+        gain_mean = seg_mean.set_index(["segment", "method"])[
+            ["kp_mean", "ki_mean", "kd_mean"]
+        ]
+        st.bar_chart(gain_mean)
+
+    st.subheader("90 -> 73 RPM Deceleration Snapshot")
+    if gain_df.empty:
+        st.warning("No deceleration gain snapshot found.")
+    else:
+        dd20 = gain_df[gain_df["method"].eq("Full_Diffusion_DDIM20")].copy()
+        summary = pd.DataFrame(
+            [
+                {
+                    "window": "0.0-0.5 s",
+                    "Kp": dd20["kp_0_5s"].mean(),
+                    "Ki": dd20["ki_0_5s"].mean(),
+                    "Kd": dd20["kd_0_5s"].mean(),
+                },
+                {
+                    "window": "1.0-2.0 s",
+                    "Kp": dd20["kp_1_2s"].mean(),
+                    "Ki": dd20["ki_1_2s"].mean(),
+                    "Kd": dd20["kd_1_2s"].mean(),
+                },
+            ]
+        )
+        c1, c2 = st.columns([1.1, 1.0])
+        c1.dataframe(style_numeric(summary), hide_index=True, use_container_width=True)
+        c1.bar_chart(summary.set_index("window")[["Kp", "Ki", "Kd"]])
+
+        rpm_pwm = pd.DataFrame(
+            [
+                ["RPM at 1 s", dd20["rpm_1s"].mean()],
+                ["RPM at 2 s", dd20["rpm_2s_end"].mean()],
+                ["Mean PWM", dd20["pwm_mean"].mean()],
+            ],
+            columns=["Metric", "Value"],
+        )
+        c2.dataframe(style_numeric(rpm_pwm), hide_index=True, use_container_width=True)
+        c2.markdown(
+            """
+            <div class="note">
+            The final DDIM20 policy consistently used high Ki and max Kd during
+            the 90 -> 73 RPM deceleration segment. This data-driven gain pattern
+            is one reason the full DDIM20 model outperformed longer DDIM runs and
+            the lightweight model.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+with realtime_tab:
+    st.subheader("Realtime Monitor")
+    st.markdown(
+        '<div class="section-caption">Optional live view for new controller logs. Final results above do not depend on this tab.</div>',
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Refresh realtime data", type="secondary"):
+        st.rerun()
+
+    log_file = get_latest_log_file()
+    if log_file is None:
+        st.info("No realtime log CSV found in the configured log directory.")
+    else:
+        st.caption(f"Current log file: `{log_file}`")
+        try:
+            live_df = pd.read_csv(log_file)
+        except Exception as exc:
+            st.error(f"Failed to read realtime log: {exc}")
+            live_df = pd.DataFrame()
+
+        if live_df.empty:
+            st.warning("Realtime log is empty.")
+        else:
+            latest = live_df.iloc[-1]
+            live_metrics = []
+            for label, col, suffix in [
+                ("Target", "target", " RPM"),
+                ("Current", "current", " RPM"),
+                ("Error", "error", ""),
+                ("PWM", "pwm", ""),
+                ("Kp", "kp", ""),
+                ("Ki", "ki", ""),
+                ("Kd", "kd", ""),
+            ]:
+                if col in live_df.columns:
+                    live_metrics.append((label, latest[col], suffix))
+            if live_metrics:
+                metric_row(live_metrics[:4])
+                if len(live_metrics) > 4:
+                    metric_row(live_metrics[4:])
+
+            if "time" in live_df.columns:
+                indexed = live_df.set_index("time")
+                c1, c2 = st.columns(2)
+                rpm_cols = [c for c in ["target", "current", "rpm"] if c in indexed.columns]
+                if rpm_cols:
+                    c1.markdown("**RPM Tracking**")
+                    c1.line_chart(indexed[rpm_cols])
+                pwm_cols = [c for c in ["pwm", "raw_pwm"] if c in indexed.columns]
+                if pwm_cols:
+                    c2.markdown("**PWM**")
+                    c2.line_chart(indexed[pwm_cols])
+                gain_cols = [c for c in ["kp", "ki", "kd"] if c in indexed.columns]
+                if gain_cols:
+                    st.markdown("**Applied Gains**")
+                    st.line_chart(indexed[gain_cols])
+            st.dataframe(live_df.tail(30), use_container_width=True)
+
+with artifacts_tab:
+    st.subheader("Final Artifact Bundle")
+    st.markdown(
+        '<div class="section-caption">Files committed for the compact final result.</div>',
+        unsafe_allow_html=True,
+    )
+
+    files = []
+    for path in sorted(ARTIFACT_DIR.rglob("*")):
+        if path.is_file():
+            files.append(
+                {
+                    "path": str(path.relative_to(BASE_DIR)),
+                    "size_kb": path.stat().st_size / 1024,
+                }
+            )
+    st.dataframe(style_numeric(pd.DataFrame(files)), hide_index=True, use_container_width=True)
+
+    st.subheader("Reproduce Final Runtime")
     st.code(
         "\n".join(
             [
-                "Online:",
-                "  controller state (28 features)",
-                "    -> Direct Policy MLP",
-                "    -> normalized [kp, ki, kd]",
-                "    -> gain bounds",
-                "    -> 20-step gain chunk",
-                "    -> Kafka / delay-aware controller",
-                "",
-                "Training:",
-                "  state -> Direct Policy MLP -> predicted gain",
-                "    -> frozen MT-DL horizon surrogate",
-                "    -> predicted horizon metrics",
-                "    -> loss: IAE + PWM/risk + gain-anchor + smoothness",
+                "call C:\\Users\\Jaewook\\anaconda3\\Scripts\\activate.bat tensorflow",
+                "python src\\gain_recommender_server.py ^",
+                "  --generator diffusion_unet_gain_chunk ^",
+                "  --diffusion-unet-model-path artifacts\\final_ddim20\\models\\diffusion_gain_chunk_unet_balanced1000_global_topk_full_20260508_193250.joblib ^",
+                "  --diffusion-ddim-steps 20 ^",
+                "  --diffusion-sample-count 1 ^",
+                "  --inference-delay 0.5 ^",
+                "  --disable-artificial-inference-sleep ^",
+                "  --chunk-horizon-steps 20 ^",
+                "  --command-min-interval 0.5",
             ]
         ),
-        language="text",
+        language="bat",
     )
-
-    final_path = get_latest_file(
-        SUMMARY_DIR, "final_clean_comparison_summary_*.csv"
-    )
-    final_df = read_csv_if_exists(final_path)
-
-    final5_summary_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_v1_final5_validation_summary_*.csv"
-    )
-    final5_summary_df = read_csv_if_exists(final5_summary_path)
-    final5_raw_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_v1_final5_validation_raw_*.csv"
-    )
-    final5_raw_df = read_csv_if_exists(final5_raw_path)
-    final5_manifest_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_v1_final5_scenario_manifest_*.csv"
-    )
-    final5_manifest_df = read_csv_if_exists(final5_manifest_path)
-
-    if final5_summary_df is not None:
-        st.markdown("**Final 5-Repeat Validation Summary**")
-        st.caption(f"Source: {final5_summary_path.name}")
-        final5_cols = [
-            "scenario",
-            "category",
-            "n",
-            "IAE",
-            "IAE_std",
-            "after_change_IAE",
-            "after_change_IAE_std",
-            "mean_pwm",
-            "max_pwm",
-            "max_pwm_std",
-            "latency_generator_duration_sec_p90",
-            "delta_IAE_vs_clean",
-            "delta_after_change_IAE_vs_clean",
-            "delta_max_pwm_vs_clean",
-        ]
-        st.dataframe(
-            pretty_dataframe(select_columns(final5_summary_df, final5_cols)),
-            use_container_width=True,
-        )
-
-        chart_cols = [
-            col
-            for col in ["IAE", "after_change_IAE", "max_pwm"]
-            if col in final5_summary_df.columns
-        ]
-        if chart_cols:
-            chart_df = final5_summary_df[["scenario", *chart_cols]].copy()
-            st.bar_chart(chart_df.set_index("scenario")[chart_cols])
-
-    reliability_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_v1_reliability_compact_*.csv"
-    )
-    reliability_df = read_csv_if_exists(reliability_path)
-    if reliability_df is not None:
-        st.markdown("**Direct Policy v1 Real-Motor Reliability**")
-        st.caption(f"Source: {reliability_path.name}")
-        reliability_cols = [
-            "scenario_id",
-            "target_profile",
-            "runs",
-            "IAE_mean",
-            "IAE_std",
-            "IAE_cv_percent",
-            "after_change_IAE_mean",
-            "after_change_IAE_std",
-            "max_pwm_mean",
-            "max_pwm_max",
-            "saturation_ratio_percent_max",
-            "unsafe_gain_discard_count_max",
-            "latency_generator_duration_sec_p90_mean",
-            "latency_source_to_accept_sec_p90_mean",
-        ]
-        st.dataframe(
-            pretty_dataframe(select_columns(reliability_df, reliability_cols)),
-            use_container_width=True,
-        )
-
-        reliability_chart_cols = [
-            col
-            for col in ["IAE_mean", "after_change_IAE_mean", "max_pwm_mean"]
-            if col in reliability_df.columns
-        ]
-        if reliability_chart_cols and "target_profile" in reliability_df.columns:
-            st.bar_chart(
-                reliability_df.set_index("target_profile")[reliability_chart_cols]
-            )
-
-    baseline_compare_path = get_latest_file(
-        SUMMARY_DIR, "baseline_comparison_same_scenarios_summary_*.csv"
-    )
-    baseline_compare_df = read_csv_if_exists(baseline_compare_path)
-    baseline_overall_path = get_latest_file(
-        SUMMARY_DIR, "baseline_comparison_same_scenarios_overall_*.csv"
-    )
-    baseline_overall_df = read_csv_if_exists(baseline_overall_path)
-    if baseline_compare_df is not None:
-        st.markdown("**Same-Scenario Baseline Comparison**")
-        st.caption(f"Source: {baseline_compare_path.name}")
-
-        if baseline_overall_df is not None:
-            st.caption(f"Overall source: {baseline_overall_path.name}")
-            overall_cols = [
-                "model_label",
-                "scenarios",
-                "IAE_mean",
-                "after_change_IAE_mean",
-                "max_pwm_mean",
-                "max_pwm_observed",
-                "saturation_max",
-                "generator_p90_mean",
-            ]
-            st.dataframe(
-                pretty_dataframe(select_columns(baseline_overall_df, overall_cols)),
-                use_container_width=True,
-            )
-
-        compare_cols = [
-            "target_profile",
-            "model_label",
-            "runs",
-            "IAE_mean",
-            "IAE_std",
-            "after_change_IAE_mean",
-            "max_pwm_mean",
-            "max_pwm_max",
-            "delta_IAE_vs_direct_v1",
-            "delta_after_change_IAE_vs_direct_v1",
-            "is_best_IAE",
-        ]
-        st.dataframe(
-            pretty_dataframe(select_columns(baseline_compare_df, compare_cols)),
-            use_container_width=True,
-        )
-
-        if {"target_profile", "model_label", "IAE_mean"}.issubset(
-            baseline_compare_df.columns
-        ):
-            chart_df = baseline_compare_df.pivot_table(
-                index="target_profile",
-                columns="model_label",
-                values="IAE_mean",
-                aggfunc="first",
-            )
-            st.bar_chart(chart_df)
-
-    if final5_manifest_df is not None:
-        st.markdown("**Final Scenario Definition**")
-        st.caption(f"Source: {final5_manifest_path.name}")
-        manifest_cols = [
-            "scenario",
-            "category",
-            "target_sequence",
-            "target_change_times",
-            "sim_time",
-            "repeats",
-            "inference_delay_sec",
-            "chunk_horizon_steps",
-            "description",
-        ]
-        st.dataframe(
-            select_columns(final5_manifest_df, manifest_cols),
-            use_container_width=True,
-        )
-
-    st.markdown("**Ablation Summary**")
-    st.dataframe(make_ablation_summary(), use_container_width=True)
-
-    if final_df is not None:
-        st.markdown("**Clean Method Comparison**")
-        st.caption(f"Source: {final_path.name}")
-
-        best_final = final_df.sort_values(["scenario_tag", "IAE_mean"]).groupby(
-            "scenario", as_index=False
-        ).head(1)
-        best_cols = [
-            "scenario",
-            "method",
-            "IAE_mean",
-            "after_change_IAE_mean",
-            "max_pwm_mean",
-            "latency_generator_duration_sec_p90_mean",
-        ]
-        st.dataframe(
-            pretty_dataframe(select_columns(best_final, best_cols)),
-            use_container_width=True,
-        )
-
-        final_cols = [
-            "scenario",
-            "method",
-            "n",
-            "IAE_mean",
-            "IAE_std",
-            "after_change_IAE_mean",
-            "after_change_IAE_std",
-            "mean_pwm_mean",
-            "max_pwm_mean",
-            "schedule_chunk_accepted_count_mean",
-            "schedule_fallback_count_mean",
-            "latency_generator_duration_sec_p90_mean",
-            "IAE_rank",
-        ]
-        final_view = select_columns(final_df, final_cols)
-        st.dataframe(pretty_dataframe(final_view), use_container_width=True)
-
-        chart_df = select_columns(
-            final_df,
-            ["scenario", "method", "IAE_mean", "after_change_IAE_mean"],
-        )
-        if chart_df is not None:
-            chart_df = chart_df.copy()
-            chart_df["case"] = chart_df["scenario"] + " | " + chart_df["method"]
-            st.bar_chart(chart_df.set_index("case")[["IAE_mean"]])
-    else:
-        st.info("No clean method comparison summary found.")
-
-    raw_final_path = get_latest_file(
-        SUMMARY_DIR, "final_clean_comparison_raw_metrics_*.csv"
-    )
-    raw_final_df = read_csv_if_exists(raw_final_path)
-    interpretation_path = get_latest_file(
-        SUMMARY_DIR, "final_clean_direct_vs_mtdl_interpretation_*.csv"
-    )
-    interpretation_df = read_csv_if_exists(interpretation_path)
-
-    if raw_final_df is not None and final5_raw_df is not None:
-        st.markdown("**Representative Trajectory: Clean Direct vs V1**")
-        comparable = [
-            scenario
-            for scenario in final5_raw_df["scenario"].dropna().unique()
-            if scenario in set(raw_final_df["scenario"].dropna().unique())
-        ]
-        if comparable:
-            selected_v1_scenario = st.selectbox(
-                "Scenario for Clean vs V1 trajectory",
-                comparable,
-                index=0,
-            )
-            clean_row, clean_log = load_representative_log(
-                raw_final_df,
-                selected_v1_scenario,
-                "Direct policy MLP",
-            )
-            v1_subset = final5_raw_df[
-                final5_raw_df["scenario"].eq(selected_v1_scenario)
-            ]
-            v1_row = representative_row_by_iae(v1_subset)
-            v1_log = (
-                load_log_from_metrics_name(v1_row["metrics_file"])
-                if v1_row is not None and "metrics_file" in v1_row
-                else None
-            )
-
-            if clean_log is None or v1_log is None:
-                st.warning("Representative Clean/V1 log pair not found.")
-            else:
-                compare_rows = []
-                if clean_row is not None:
-                    row = dict(clean_row)
-                    row["model"] = "Clean Direct"
-                    compare_rows.append(row)
-                if v1_row is not None:
-                    row = dict(v1_row)
-                    row["model"] = "V1 Surrogate-Objective"
-                    compare_rows.append(row)
-                metric_cols = [
-                    "model",
-                    "IAE",
-                    "after_change_IAE",
-                    "mean_pwm",
-                    "max_pwm",
-                    "latency_generator_duration_sec_p90",
-                    "metrics_file",
-                ]
-                st.dataframe(
-                    pretty_dataframe(
-                        select_columns(pd.DataFrame(compare_rows), metric_cols)
-                    ),
-                    use_container_width=True,
-                )
-
-                rpm_chart = comparison_series_named(
-                    [("Clean", clean_log), ("V1", v1_log)],
-                    ["target", "current"],
-                )
-                if rpm_chart is not None:
-                    st.caption("Target and RPM")
-                    st.line_chart(rpm_chart)
-
-                error_chart = comparison_series_named(
-                    [("Clean", clean_log), ("V1", v1_log)],
-                    ["error"],
-                )
-                if error_chart is not None:
-                    st.caption("Tracking Error")
-                    st.line_chart(error_chart)
-
-                pwm_chart = comparison_series_named(
-                    [("Clean", clean_log), ("V1", v1_log)],
-                    ["pwm"],
-                )
-                if pwm_chart is not None:
-                    st.caption("PWM")
-                    st.line_chart(pwm_chart)
-
-                gain_chart = comparison_series_named(
-                    [("Clean", clean_log), ("V1", v1_log)],
-                    ["kp", "ki", "kd"],
-                )
-                if gain_chart is not None:
-                    st.caption("Applied Gains")
-                    st.line_chart(gain_chart)
-        else:
-            st.info("No overlapping Clean/V1 scenarios found for trajectory plots.")
-
-    if interpretation_df is not None:
-        st.markdown("**Direct Policy vs MT-DL Interpretation**")
-        st.caption(f"Source: {interpretation_path.name}")
-        interpretation_cols = [
-            "scenario",
-            "winner_by_IAE",
-            "direct_minus_mtdl_IAE",
-            "direct_minus_mtdl_after_change_IAE",
-            "direct_minus_mtdl_max_pwm",
-            "direct_latency_advantage_sec",
-            "improvement_focus",
-        ]
-        st.dataframe(
-            pretty_dataframe(select_columns(interpretation_df, interpretation_cols)),
-            use_container_width=True,
-        )
-
-    tiebreak_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_tiebreak_eval_comparison_*.csv"
-    )
-    tiebreak_df = read_csv_if_exists(tiebreak_path)
-
-    if tiebreak_df is not None:
-        st.markdown("**Direct Policy Improvement Trial**")
-        st.caption(f"Source: {tiebreak_path.name}")
-        tiebreak_cols = [
-            "label",
-            "n",
-            "IAE",
-            "after_change_IAE",
-            "mean_pwm",
-            "max_pwm",
-            "latency_generator_duration_sec_p90",
-            "target_81_IAE",
-            "target_100_IAE",
-            "target_95_IAE",
-            "target_90_IAE",
-            "target_73_IAE",
-        ]
-        st.dataframe(
-            pretty_dataframe(select_columns(tiebreak_df, tiebreak_cols)),
-            use_container_width=True,
-        )
-
-    dbfeature_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_dbfeature_eval_comparison_*.csv"
-    )
-    dbfeature_df = read_csv_if_exists(dbfeature_path)
-
-    if dbfeature_df is not None:
-        st.markdown("**Direct Policy DB-Reference Feature Trial**")
-        st.caption(f"Source: {dbfeature_path.name}")
-        dbfeature_cols = [
-            "label",
-            "n",
-            "IAE",
-            "after_change_IAE",
-            "mean_pwm",
-            "max_pwm",
-            "latency_generator_duration_sec_p90",
-            "target_81_IAE",
-            "target_100_IAE",
-            "target_95_IAE",
-            "target_90_IAE",
-            "target_73_IAE",
-        ]
-        st.dataframe(
-            pretty_dataframe(select_columns(dbfeature_df, dbfeature_cols)),
-            use_container_width=True,
-        )
-
-    transition_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_transition_eval_comparison_*.csv"
-    )
-    transition_df = read_csv_if_exists(transition_path)
-
-    if transition_df is not None:
-        st.markdown("**Direct Policy Transition-Context Trial**")
-        st.caption(f"Source: {transition_path.name}")
-        transition_cols = [
-            "label",
-            "n",
-            "IAE",
-            "after_change_IAE",
-            "mean_pwm",
-            "max_pwm",
-            "latency_generator_duration_sec_p90",
-            "target_81_IAE",
-            "target_100_IAE",
-            "target_95_IAE",
-            "target_90_IAE",
-            "target_73_IAE",
-        ]
-        st.dataframe(
-            pretty_dataframe(select_columns(transition_df, transition_cols)),
-            use_container_width=True,
-        )
-
-    pwmaware_transition_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_pwmaware_transition_eval_comparison_*.csv"
-    )
-    pwmaware_transition_df = read_csv_if_exists(pwmaware_transition_path)
-
-    if pwmaware_transition_df is not None:
-        st.markdown("**Direct Policy PWM-Aware Transition Trial**")
-        st.caption(f"Source: {pwmaware_transition_path.name}")
-        st.caption(
-            "This trial reduced peak PWM in the dynamic case, but increased IAE, "
-            "so the stable latest model remains the clean Direct policy."
-        )
-        pwmaware_transition_cols = [
-            "label",
-            "n",
-            "IAE",
-            "after_change_IAE",
-            "mean_pwm",
-            "max_pwm",
-            "near_high_saturation_ratio_percent",
-            "latency_generator_duration_sec_p90",
-            "target_81_IAE",
-            "target_100_IAE",
-            "target_95_IAE",
-            "target_90_IAE",
-            "target_73_IAE",
-        ]
-        st.dataframe(
-            pretty_dataframe(
-                select_columns(pwmaware_transition_df, pwmaware_transition_cols)
-            ),
-            use_container_width=True,
-        )
-
-    iae_first_screening_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_iae_first_screening_*.csv"
-    )
-    iae_first_screening_df = read_csv_if_exists(iae_first_screening_path)
-
-    if iae_first_screening_df is not None:
-        st.markdown("**Direct Policy IAE-First Candidate Screening**")
-        st.caption(f"Source: {iae_first_screening_path.name}")
-        st.caption(
-            "One-run screening for weak PWM tie-break candidates. The best "
-            "candidate did not beat the clean Direct policy baseline."
-        )
-        iae_first_cols = [
-            "candidate",
-            "scenario",
-            "n",
-            "IAE",
-            "after_change_IAE",
-            "mean_pwm",
-            "max_pwm",
-            "latency_generator_duration_sec_p90",
-            "target_81_IAE",
-            "target_100_IAE",
-            "target_95_IAE",
-            "target_90_IAE",
-            "target_73_IAE",
-            "combined_IAE",
-        ]
-        st.dataframe(
-            pretty_dataframe(select_columns(iae_first_screening_df, iae_first_cols)),
-            use_container_width=True,
-        )
-
-    clean_wide_validation_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_clean_wide_validation_comparison_*.csv"
-    )
-    clean_wide_validation_df = read_csv_if_exists(clean_wide_validation_path)
-
-    if clean_wide_validation_df is not None:
-        st.markdown("**Direct Policy Clean-Structure Wide MLP Validation**")
-        st.caption(f"Source: {clean_wide_validation_path.name}")
-        st.caption(
-            "Clean input features with a wider MLP looked promising in one run, "
-            "but the three-run validation did not beat the clean Direct baseline."
-        )
-        clean_wide_cols = [
-            "label",
-            "n",
-            "IAE",
-            "IAE_std",
-            "after_change_IAE",
-            "after_change_IAE_std",
-            "mean_pwm",
-            "max_pwm",
-            "max_pwm_std",
-            "latency_generator_duration_sec_p90",
-            "target_81_IAE",
-            "target_100_IAE",
-            "target_95_IAE",
-            "target_90_IAE",
-            "target_73_IAE",
-        ]
-        st.dataframe(
-            pretty_dataframe(
-                select_columns(clean_wide_validation_df, clean_wide_cols)
-            ),
-            use_container_width=True,
-        )
-
-    residual_db_screening_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_residual_db_screening_*.csv"
-    )
-    residual_db_screening_df = read_csv_if_exists(residual_db_screening_path)
-
-    if residual_db_screening_df is not None:
-        st.markdown("**Direct Policy Residual-DB Screening**")
-        st.caption(f"Source: {residual_db_screening_path.name}")
-        st.caption(
-            "Discrete DB interpolation was used as the policy prior and the MLP "
-            "predicted residual gain corrections. The first real screening did "
-            "not beat the clean Direct baseline."
-        )
-        residual_db_cols = [
-            "candidate",
-            "scenario",
-            "n",
-            "IAE",
-            "after_change_IAE",
-            "mean_pwm",
-            "max_pwm",
-            "latency_generator_duration_sec_p90",
-            "target_81_IAE",
-            "target_100_IAE",
-            "target_95_IAE",
-            "target_90_IAE",
-            "target_73_IAE",
-            "combined_IAE",
-        ]
-        st.dataframe(
-            pretty_dataframe(
-                select_columns(residual_db_screening_df, residual_db_cols)
-            ),
-            use_container_width=True,
-        )
-
-    rank_weighted_screening_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_rank_weighted_screening_*.csv"
-    )
-    rank_weighted_screening_df = read_csv_if_exists(rank_weighted_screening_path)
-
-    if rank_weighted_screening_df is not None:
-        st.markdown("**Direct Policy Rank-Weighted Screening**")
-        st.caption(f"Source: {rank_weighted_screening_path.name}")
-        st.caption(
-            "Multiple top-ranked gains per context were kept with soft weights. "
-            "Offline gain MAE improved, but real control IAE did not beat baseline."
-        )
-        rank_weighted_cols = [
-            "candidate",
-            "scenario",
-            "n",
-            "IAE",
-            "after_change_IAE",
-            "mean_pwm",
-            "max_pwm",
-            "latency_generator_duration_sec_p90",
-            "target_81_IAE",
-            "target_100_IAE",
-            "target_95_IAE",
-            "target_90_IAE",
-            "target_73_IAE",
-            "combined_IAE",
-        ]
-        st.dataframe(
-            pretty_dataframe(
-                select_columns(rank_weighted_screening_df, rank_weighted_cols)
-            ),
-            use_container_width=True,
-        )
-
-    surrogate_objective_validation_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_surrogate_objective_validation_comparison_*.csv"
-    )
-    surrogate_objective_validation_df = read_csv_if_exists(
-        surrogate_objective_validation_path
-    )
-
-    if surrogate_objective_validation_df is not None:
-        st.markdown("**Direct Policy Surrogate-Objective Validation**")
-        st.caption(f"Source: {surrogate_objective_validation_path.name}")
-        st.caption(
-            "The direct policy was trained through a frozen MT-DL horizon model, "
-            "optimizing predicted closed-loop IAE instead of matching gain labels."
-        )
-        surrogate_objective_cols = [
-            "label",
-            "n",
-            "IAE",
-            "IAE_std",
-            "after_change_IAE",
-            "after_change_IAE_std",
-            "settling_time_after_change",
-            "mean_pwm",
-            "max_pwm",
-            "max_pwm_std",
-            "latency_generator_duration_sec_p90",
-            "target_81_IAE",
-            "target_100_IAE",
-            "target_95_IAE",
-            "target_90_IAE",
-            "target_73_IAE",
-        ]
-        st.dataframe(
-            pretty_dataframe(
-                select_columns(
-                    surrogate_objective_validation_df,
-                    surrogate_objective_cols,
-                )
-            ),
-            use_container_width=True,
-        )
-
-    surrogate_objective_extra_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_surrogate_objective_extra_robustness_*.csv"
-    )
-    surrogate_objective_extra_df = read_csv_if_exists(
-        surrogate_objective_extra_path
-    )
-
-    if surrogate_objective_extra_df is not None:
-        st.markdown("**Surrogate-Objective Extra Robustness Check**")
-        st.caption(f"Source: {surrogate_objective_extra_path.name}")
-        st.caption(
-            "Additional seen and reverse-transition scenarios used to confirm "
-            "that the surrogate-objective policy improvement generalizes beyond "
-            "the first validation set."
-        )
-        surrogate_extra_cols = [
-            "label",
-            "n",
-            "IAE",
-            "IAE_std",
-            "after_change_IAE",
-            "after_change_IAE_std",
-            "settling_time_after_change",
-            "mean_pwm",
-            "max_pwm",
-            "max_pwm_std",
-            "latency_generator_duration_sec_p90",
-            "target_70_IAE",
-            "target_85_IAE",
-            "target_100_IAE",
-        ]
-        st.dataframe(
-            pretty_dataframe(
-                select_columns(surrogate_objective_extra_df, surrogate_extra_cols)
-            ),
-            use_container_width=True,
-        )
-
-    surrogate_v2_validation_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_surrogate_objective_v2_validation_comparison_*.csv"
-    )
-    surrogate_v2_validation_df = read_csv_if_exists(surrogate_v2_validation_path)
-
-    if surrogate_v2_validation_df is not None:
-        st.markdown("**Surrogate-Objective V2 PWM Penalty Validation**")
-        st.caption(f"Source: {surrogate_v2_validation_path.name}")
-        st.caption(
-            "PWM/risk penalties were increased to reduce peak PWM. The tested "
-            "mild V2 did not beat V1 on the four-scenario average."
-        )
-        surrogate_v2_cols = [
-            "label",
-            "scenario",
-            "model",
-            "n",
-            "IAE",
-            "after_change_IAE",
-            "mean_pwm",
-            "max_pwm",
-            "delta_vs_v1_IAE",
-            "delta_vs_v1_after_change_IAE",
-            "delta_vs_v1_max_pwm",
-        ]
-        st.dataframe(
-            pretty_dataframe(
-                select_columns(surrogate_v2_validation_df, surrogate_v2_cols)
-            ),
-            use_container_width=True,
-        )
-
-    surrogate_v2_model_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_surrogate_objective_v2_model_summary_*.csv"
-    )
-    surrogate_v2_model_df = read_csv_if_exists(surrogate_v2_model_path)
-
-    if surrogate_v2_model_df is not None:
-        st.caption(f"V2 model summary source: {surrogate_v2_model_path.name}")
-        st.dataframe(
-            pretty_dataframe(surrogate_v2_model_df),
-            use_container_width=True,
-        )
-
-    v1_robust_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_v1_robust_validation_summary_*.csv"
-    )
-    v1_robust_df = read_csv_if_exists(v1_robust_path)
-
-    if v1_robust_df is not None:
-        st.markdown("**V1 Surrogate-Objective Robust Validation**")
-        st.caption(f"Source: {v1_robust_path.name}")
-        st.caption(
-            "Six-scenario validation for the selected V1 policy, including "
-            "seen, unseen, dynamic, reverse, large-step, and mixed transitions."
-        )
-        v1_robust_cols = [
-            "scenario",
-            "n",
-            "IAE",
-            "IAE_std",
-            "after_change_IAE",
-            "after_change_IAE_std",
-            "mean_pwm",
-            "max_pwm",
-            "max_pwm_std",
-            "latency_generator_duration_sec_p90",
-            "delta_IAE_vs_clean",
-            "delta_after_change_IAE_vs_clean",
-            "delta_max_pwm_vs_clean",
-        ]
-        st.dataframe(
-            pretty_dataframe(select_columns(v1_robust_df, v1_robust_cols)),
-            use_container_width=True,
-        )
-
-    v1_robust_model_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_v1_robust_validation_model_summary_*.csv"
-    )
-    v1_robust_model_df = read_csv_if_exists(v1_robust_model_path)
-
-    if v1_robust_model_df is not None:
-        st.caption(f"V1 robust model summary source: {v1_robust_model_path.name}")
-        st.dataframe(
-            pretty_dataframe(v1_robust_model_df),
-            use_container_width=True,
-        )
-
-    final5_manifest_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_v1_final5_scenario_manifest_*.csv"
-    )
-    final5_manifest_df = read_csv_if_exists(final5_manifest_path)
-
-    if final5_manifest_df is not None:
-        st.markdown("**V1 Final 5-Repeat Scenario Set**")
-        st.caption(f"Source: {final5_manifest_path.name}")
-        manifest_cols = [
-            "scenario",
-            "category",
-            "target_sequence",
-            "target_change_times",
-            "sim_time",
-            "repeats",
-            "inference_delay_sec",
-            "chunk_horizon_steps",
-            "description",
-        ]
-        st.dataframe(
-            select_columns(final5_manifest_df, manifest_cols),
-            use_container_width=True,
-        )
-
-    final5_summary_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_v1_final5_validation_summary_*.csv"
-    )
-    final5_summary_df = read_csv_if_exists(final5_summary_path)
-
-    if final5_summary_df is not None:
-        st.markdown("**V1 Final 5-Repeat Validation Results**")
-        st.caption(f"Source: {final5_summary_path.name}")
-        final5_cols = [
-            "scenario",
-            "category",
-            "n",
-            "IAE",
-            "IAE_std",
-            "after_change_IAE",
-            "after_change_IAE_std",
-            "mean_pwm",
-            "max_pwm",
-            "max_pwm_std",
-            "latency_generator_duration_sec_p90",
-            "delta_IAE_vs_clean",
-            "delta_after_change_IAE_vs_clean",
-            "delta_max_pwm_vs_clean",
-        ]
-        st.dataframe(
-            pretty_dataframe(select_columns(final5_summary_df, final5_cols)),
-            use_container_width=True,
-        )
-
-    final5_model_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_v1_final5_validation_model_summary_*.csv"
-    )
-    final5_model_df = read_csv_if_exists(final5_model_path)
-
-    if final5_model_df is not None:
-        st.caption(f"V1 final 5-repeat model summary source: {final5_model_path.name}")
-        st.dataframe(
-            pretty_dataframe(final5_model_df),
-            use_container_width=True,
-        )
-
-    if raw_final_df is not None:
-        st.markdown("**Representative Trajectory: Direct Policy vs MT-DL**")
-        scenarios = list(raw_final_df["scenario"].dropna().unique())
-        selected_scenario = st.selectbox(
-            "Scenario for trajectory comparison",
-            scenarios,
-            index=0,
-        )
-
-        direct_row, direct_log = load_representative_log(
-            raw_final_df, selected_scenario, "Direct policy MLP"
-        )
-        mtdl_row, mtdl_log = load_representative_log(
-            raw_final_df, selected_scenario, "MT-DL surrogate"
-        )
-
-        if direct_log is None or mtdl_log is None:
-            st.warning("Representative log pair not found for this scenario.")
-        else:
-            metric_cols = [
-                "method",
-                "rep",
-                "IAE",
-                "after_change_IAE",
-                "mean_pwm",
-                "max_pwm",
-                "latency_generator_duration_sec_p90",
-                "metrics_file",
-            ]
-            pair_df = pd.DataFrame([direct_row, mtdl_row])
-            st.dataframe(
-                pretty_dataframe(select_columns(pair_df, metric_cols)),
-                use_container_width=True,
-            )
-
-            rpm_chart = comparison_series(direct_log, mtdl_log, ["target", "current"])
-            if rpm_chart is not None:
-                st.caption("Target and RPM")
-                st.line_chart(rpm_chart)
-
-            error_chart = comparison_series(direct_log, mtdl_log, ["error"])
-            if error_chart is not None:
-                st.caption("Tracking Error")
-                st.line_chart(error_chart)
-
-            pwm_chart = comparison_series(direct_log, mtdl_log, ["pwm"])
-            if pwm_chart is not None:
-                st.caption("PWM")
-                st.line_chart(pwm_chart)
-
-            gain_chart = comparison_series(direct_log, mtdl_log, ["kp", "ki", "kd"])
-            if gain_chart is not None:
-                st.caption("Applied Gains")
-                st.line_chart(gain_chart)
-
-    horizon_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_chunk_horizon_sweep_dynamic_*.csv"
-    )
-    horizon_df = read_csv_if_exists(horizon_path)
-
-    if horizon_df is not None:
-        best_horizon = horizon_df.sort_values("IAE_mean").head(1)
-        st.markdown("**Chunk Horizon Sweep**")
-        st.caption(f"Source: {horizon_path.name}")
-        show_metric_cards(
-            best_horizon,
+    st.code(
+        "\n".join(
             [
-                ("Best Horizon", "horizon_steps", " steps"),
-                ("IAE", "IAE_mean", ""),
-                ("After-change IAE", "after_change_IAE_mean", ""),
-                ("Max PWM", "max_pwm_mean", ""),
-            ],
-        )
-
-        horizon_cols = [
-            "horizon_steps",
-            "horizon_sec",
-            "IAE_mean",
-            "after_change_IAE_mean",
-            "mean_pwm_mean",
-            "max_pwm_mean",
-            "schedule_chunk_accepted_count_mean",
-            "schedule_fallback_count_mean",
-            "latency_source_to_apply_sec_p90_mean",
-            "latency_generator_duration_sec_p90_mean",
-        ]
-        horizon_view = select_columns(horizon_df, horizon_cols)
-        st.dataframe(pretty_dataframe(horizon_view), use_container_width=True)
-
-        chart_cols = [
-            col
-            for col in ["IAE_mean", "after_change_IAE_mean", "max_pwm_mean"]
-            if col in horizon_df.columns
-        ]
-        if chart_cols:
-            st.line_chart(horizon_df.set_index("horizon_steps")[chart_cols])
-    else:
-        st.info("No chunk horizon sweep summary found.")
-
-    delay_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_inference_delay_sweep_dynamic_*.csv"
-    )
-    delay_df = read_csv_if_exists(delay_path)
-
-    if delay_df is not None:
-        best_delay = delay_df.sort_values("IAE_mean").head(1)
-        st.markdown("**Inference Delay Sweep**")
-        st.caption(f"Source: {delay_path.name}")
-        show_metric_cards(
-            best_delay,
-            [
-                ("Best Delay", "delay_sec", " s"),
-                ("IAE", "IAE_mean", ""),
-                ("After-change IAE", "after_change_IAE_mean", ""),
-                ("Max PWM", "max_pwm_mean", ""),
-            ],
-        )
-
-        delay_cols = [
-            "delay_sec",
-            "IAE_mean",
-            "after_change_IAE_mean",
-            "mean_pwm_mean",
-            "max_pwm_mean",
-            "schedule_chunk_accepted_count_mean",
-            "latency_source_to_accept_sec_p50_mean",
-            "latency_source_to_apply_sec_p90_mean",
-            "latency_generator_duration_sec_p90_mean",
-        ]
-        delay_view = select_columns(delay_df, delay_cols)
-        st.dataframe(pretty_dataframe(delay_view), use_container_width=True)
-
-        chart_cols = [
-            col for col in ["IAE_mean", "after_change_IAE_mean", "max_pwm_mean"]
-            if col in delay_df.columns
-        ]
-        if chart_cols:
-            st.line_chart(delay_df.set_index("delay_sec")[chart_cols])
-    else:
-        st.info("No inference delay sweep summary found.")
-
-    label_path = get_latest_file(
-        SUMMARY_DIR, "direct_policy_pareto_iae_label_comparison_*.csv"
-    )
-    label_df = read_csv_if_exists(label_path)
-
-    if label_df is not None:
-        st.markdown("**Direct Policy Label Comparison**")
-        st.caption(f"Source: {label_path.name}")
-        label_cols = [
-            "label",
-            "n",
-            "IAE",
-            "after_change_IAE",
-            "mean_pwm",
-            "max_pwm",
-            "latency_generator_duration_sec_p90",
-            "target_95_IAE",
-            "target_90_IAE",
-            "target_73_IAE",
-        ]
-        label_view = select_columns(label_df, label_cols)
-        st.dataframe(pretty_dataframe(label_view), use_container_width=True)
-    else:
-        st.info("No direct policy label comparison summary found.")
-
-with logs_tab:
-    st.subheader("Recent Kafka Control Metrics")
-
-    metrics_files = sorted(
-        KAFKA_CONTROL_DIR.glob("local_kafka_controller_metrics_*.csv"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-
-    if not metrics_files:
-        st.info("No Kafka metrics files found.")
-    else:
-        selected = st.selectbox(
-            "Metrics file",
-            metrics_files,
-            format_func=lambda path: path.name,
-        )
-        metrics_df = read_csv_if_exists(selected)
-        if metrics_df is not None:
-            st.caption(str(selected))
-            cols = [
-                "IAE",
-                "after_change_IAE",
-                "settling_time_after_change",
-                "mean_pwm",
-                "max_pwm",
-                "schedule_chunk_accepted_count",
-                "schedule_fallback_count",
-                "latency_source_to_accept_sec_p50",
-                "latency_source_to_apply_sec_p90",
-                "latency_generator_duration_sec_p90",
+                "python src\\local_kafka_controller.py ^",
+                "  --schedule-apply-mode delay_aware ^",
+                "  --sim-time 20 ^",
+                "  --target-sequence \"70,95,90,73\" ^",
+                "  --target-change-times \"5,10,15\" ^",
+                "  --run-label final_ddim20",
             ]
-            metric_view = select_columns(metrics_df, cols)
-            st.dataframe(pretty_dataframe(metric_view), use_container_width=True)
-
-if auto_refresh:
-    time.sleep(refresh_interval)
-    st.rerun()
+        ),
+        language="bat",
+    )
