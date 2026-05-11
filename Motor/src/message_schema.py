@@ -24,12 +24,20 @@ def make_motor_state_message(
     kp_scale: float = 1.0,
     ki_scale: float = 1.0,
     saturation_active: bool = False,
+    control_time: float = None,
+    measured_time: float = None,
+    dt: float = None,
+    prev_pwm: float = None,
+    integral: float = None,
+    backend: str = None,
+    encoder: int = None,
+    metadata: dict = None,
 ):
     """
     Local controller -> server recommender
     """
 
-    return {
+    message = {
         "timestamp": now_timestamp(),
         "run_id": run_id,
         "device_id": device_id,
@@ -50,6 +58,29 @@ def make_motor_state_message(
         "ki_scale": float(ki_scale),
         "saturation_active": bool(saturation_active),
     }
+
+    optional_float_fields = {
+        "control_time": control_time,
+        "measured_time": measured_time,
+        "dt": dt,
+        "prev_pwm": prev_pwm,
+        "integral": integral,
+    }
+
+    for key, value in optional_float_fields.items():
+        if value is not None:
+            message[key] = float(value)
+
+    if backend is not None:
+        message["backend"] = str(backend)
+
+    if encoder is not None:
+        message["encoder"] = int(encoder)
+
+    if metadata:
+        message["metadata"] = dict(metadata)
+
+    return message
 
 
 def make_gain_command_message(

@@ -1,51 +1,79 @@
-# Motor PID Gain Scheduling Project
+# Motor Diffusion Gain-Chunk Control
 
-## 1. Project Overview
+This project implements and validates an asynchronous server-assisted PID gain
+scheduling method for an ESP32-controlled DC motor.
 
-This project aims to construct a PID gain scheduling framework for motor control using Simulink-based simulation data.
+The final research direction is a conditional diffusion U-Net that generates a
+time-varying PID gain chunk. The ESP32 keeps the low-level PID loop local, while
+the PC/Kafka server asynchronously publishes future gain schedules.
 
-The overall objective is to find appropriate PID gains according to the target value and to use them as initial gains for adaptive PID control. The current framework consists of:
+## Final Method
 
-1. Simulink-based PID gain sweep
-2. Performance dataset construction
-3. Surrogate model training
-4. Surrogate-based gain optimization
-5. Simulink validation of recommended gains
-6. Target-based PID gain database construction
-7. Adaptive PID control using gain DB and linear interpolation
+- Local controller: ESP32 PID loop with encoder RPM feedback
+- Server: Kafka consumer/producer running the gain scheduler
+- Policy: conditional diffusion U-Net
+- Sampler: DDIM 20
+- Chunk: 20 steps, 0.1 s per step, 2.0 s horizon
+- Application: delay-aware schedule buffer on the local controller
 
----
+## Key Result
 
-## 2. Project Structure
+Final validation scenario:
 
 ```text
-Motor/
-├── config.py
-├── main.py
-├── dashboard.py
-├── data/
-│   ├── raw/
-│   ├── processed/
-│   │   ├── pid_performance_prediction_dataset.csv
-│   │   └── pid_gain_recommendation_dataset.csv
-│   └── simulation/
-├── results/
-│   ├── logs/
-│   ├── figures/
-│   ├── models/
-│   ├── simulink_gain_db/
-│   ├── model_gain_optimization/
-│   └── surrogate_validation/
-└── src/
-    ├── pid_controller.py
-    ├── gain_scheduler.py
-    ├── safety_guard.py
-    ├── motor_env.py
-    ├── simulink_runner.py
-    ├── simulink_gain_sweep.py
-    ├── build_training_dataset.py
-    ├── train_model.py
-    ├── optimize_gain_with_model.py
-    ├── validate_surrogate_gains.py
-    ├── compare_logs.py
-    └── compare_adaptive_targets.py
+70 -> 95 -> 90 -> 73 RPM
+target changes at 5, 10, and 15 s
+```
+
+The final DDIM20 diffusion model achieved the best real-motor tracking result
+among the tested DB/RF/DL/direct-policy/diffusion variants.
+
+Compact final artifacts are stored in:
+
+```text
+artifacts/final_ddim20/
+```
+
+Large raw logs, processed datasets, and generated intermediate results are
+ignored by git. They can be regenerated from the scripts under `src/`.
+
+## Main Runtime Commands
+
+Start the Kafka-based gain recommender:
+
+```bat
+call C:\Users\Jaewook\anaconda3\Scripts\activate.bat tensorflow
+python src\gain_recommender_server.py ^
+  --generator diffusion_unet_gain_chunk ^
+  --diffusion-unet-model-path artifacts\final_ddim20\models\diffusion_gain_chunk_unet_balanced1000_global_topk_full_20260508_193250.joblib ^
+  --diffusion-ddim-steps 20 ^
+  --diffusion-sample-count 1 ^
+  --inference-delay 0.5 ^
+  --disable-artificial-inference-sleep ^
+  --chunk-horizon-steps 20 ^
+  --command-min-interval 0.5
+```
+
+Run the ESP32 local controller:
+
+```bat
+python src\local_kafka_controller.py ^
+  --schedule-apply-mode delay_aware ^
+  --sim-time 20 ^
+  --target-sequence "70,95,90,73" ^
+  --target-change-times "5,10,15" ^
+  --run-label final_ddim20
+```
+
+## Kafka Topics
+
+- `motor_state`
+- `motor_schedule_chunk`
+- `motor_gain_command`
+
+## Notes
+
+This architecture does not replace the low-level real-time controller with a
+network loop. Kafka and the PC server only update gain chunks; if communication
+is delayed, the ESP32 continues with the currently available local PID gains or
+the latest valid schedule.

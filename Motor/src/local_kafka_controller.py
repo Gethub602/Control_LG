@@ -3,10 +3,16 @@ from pathlib import Path
 from datetime import datetime
 import time
 import uuid
+import argparse
 
 import numpy as np
 import pandas as pd
-from kafka import KafkaProducer, KafkaConsumer
+
+try:
+    from kafka import KafkaProducer, KafkaConsumer
+except ImportError:
+    KafkaProducer = None
+    KafkaConsumer = None
 
 # ============================================================
 # Path setting
@@ -63,6 +69,7 @@ from kafka_config import (
     KAFKA_BOOTSTRAP_SERVERS,
     TOPIC_MOTOR_STATE,
     TOPIC_GAIN_COMMAND,
+    TOPIC_SCHEDULE_CHUNK,
     DEVICE_ID,
     LOCAL_CONTROLLER_GROUP_ID,
 )
@@ -73,6 +80,9 @@ from message_schema import (
     make_motor_state_message,
     is_valid_gain_command,
 )
+
+from schedule_buffer import ScheduleBuffer
+from schedule_schema import PAYLOAD_KIND_GAIN
 
 
 # ============================================================
@@ -89,17 +99,17 @@ N_STEPS = int(SIM_TIME / CONTROL_DT)
 
 # ESP32 실물 보호용 PWM 변화율 제한
 # 0.10 s마다 PWM이 최대 20만 변하게 제한
-ESP32_LOCAL_PWM_RATE_LIMIT = 20.0
+ESP32_LOCAL_PWM_RATE_LIMIT = 50.0
 
 # ESP32 server gain safety guard
 ESP32_SAFE_KP_MAX = 2.0
-ESP32_SAFE_KI_MAX = 1.5
+ESP32_SAFE_KI_MAX = 2.5
 ESP32_SAFE_KD_MAX = 0.5
 
 # Backend별 target 및 disturbance 설정
 if MOTOR_BACKEND == "esp32":
-    TARGET_BEFORE = 30.0
-    TARGET_AFTER = 50.0
+    TARGET_BEFORE = 70.0
+    TARGET_AFTER = 100.0
     TARGET_CHANGE_TIME = 3.0
 
     USE_DISTURBANCE = False
@@ -130,6 +140,8 @@ else:
         "Use 'simulation' or 'esp32'."
     )
 
+TARGET_SEQUENCE = []
+TARGET_CHANGE_TIMES = []
 
 USE_SATURATION_AWARE_GAIN = True
 
@@ -140,6 +152,12 @@ RUN_ID = (
 )
 
 STATE_PUBLISH_EVERY_STEPS = 1
+
+# Prefer delay-aware chunk schedules when available. Legacy single gain commands
+# remain available as a fallback/baseline path.
+APPLY_SERVER_SCHEDULE_CHUNK = True
+SCHEDULE_APPLY_MODE = "delay_aware"  # "delay_aware" or "naive"
+SCHEDULE_BUFFER_MAX_CHUNKS = 8
 
 
 # ============================================================
@@ -217,9 +235,38 @@ def apply_pwm_rate_limit(pwm_cmd: float, prev_pwm: float, rate_limit: float) -> 
 # ============================================================
 
 def get_target_at_time(t: float) -> float:
+    if TARGET_SEQUENCE:
+        target = float(TARGET_SEQUENCE[0])
+        for change_time, next_target in zip(TARGET_CHANGE_TIMES, TARGET_SEQUENCE[1:]):
+            if t >= float(change_time):
+                target = float(next_target)
+            else:
+                break
+        return target
+
     if t < TARGET_CHANGE_TIME:
         return TARGET_BEFORE
     return TARGET_AFTER
+
+
+def parse_float_list(text: str):
+    return [
+        float(item.strip())
+        for item in str(text).split(",")
+        if item.strip()
+    ]
+
+
+def get_target_profile_label() -> str:
+    if TARGET_SEQUENCE:
+        return "->".join(f"{target:g}" for target in TARGET_SEQUENCE)
+    return f"{TARGET_BEFORE:g}->{TARGET_AFTER:g}"
+
+
+def get_first_target_change_time() -> float:
+    if TARGET_SEQUENCE and TARGET_CHANGE_TIMES:
+        return float(TARGET_CHANGE_TIMES[0])
+    return float(TARGET_CHANGE_TIME)
 
 
 def interpolate_gain_from_db(
@@ -321,6 +368,34 @@ def is_safe_esp32_gain(kp: float, ki: float, kd: float) -> bool:
         return False
 
     return True
+
+
+def set_pid_gains_preserving_integral_term(
+    pid: PIDController,
+    kp: float,
+    ki: float,
+    kd: float,
+    preserve_integral_term: bool = False,
+):
+    """
+    Apply new gains without creating a step change in the I contribution.
+
+    A server/schedule gain update can increase Ki while the controller already
+    has accumulated integral from the previous target. Rescaling integral keeps
+    old_ki * integral approximately equal to new_ki * integral.
+    """
+
+    if preserve_integral_term:
+        old_ki = float(pid.ki)
+        new_ki = float(ki)
+
+        if abs(new_ki) > 1e-12:
+            if abs(old_ki) > 1e-12:
+                pid.integral *= old_ki / new_ki
+            else:
+                pid.integral = 0.0
+
+    pid.set_gains(kp, ki, kd)
 
 
 # ============================================================
@@ -429,6 +504,12 @@ class LocalSaturationAwareGainManager:
 # ============================================================
 
 def create_producer():
+    if KafkaProducer is None:
+        raise ImportError(
+            "kafka-python is required to run the Kafka controller. "
+            "Install it in the active Python environment."
+        )
+
     producer = KafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         value_serializer=json_serializer,
@@ -437,10 +518,35 @@ def create_producer():
 
 
 def create_gain_command_consumer():
+    if KafkaConsumer is None:
+        raise ImportError(
+            "kafka-python is required to run the Kafka controller. "
+            "Install it in the active Python environment."
+        )
+
     consumer = KafkaConsumer(
         TOPIC_GAIN_COMMAND,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         group_id=f"{LOCAL_CONTROLLER_GROUP_ID}_{RUN_ID}",
+        value_deserializer=json_deserializer,
+        auto_offset_reset="latest",
+        enable_auto_commit=True,
+        consumer_timeout_ms=1,
+    )
+    return consumer
+
+
+def create_schedule_chunk_consumer():
+    if KafkaConsumer is None:
+        raise ImportError(
+            "kafka-python is required to run the Kafka controller. "
+            "Install it in the active Python environment."
+        )
+
+    consumer = KafkaConsumer(
+        TOPIC_SCHEDULE_CHUNK,
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        group_id=f"{LOCAL_CONTROLLER_GROUP_ID}_{RUN_ID}_schedule",
         value_deserializer=json_deserializer,
         auto_offset_reset="latest",
         enable_auto_commit=True,
@@ -469,6 +575,149 @@ def poll_latest_gain_command(consumer):
     return latest_command
 
 
+def poll_schedule_chunks(consumer):
+    chunks = []
+
+    records = consumer.poll(timeout_ms=1)
+
+    if not records:
+        return chunks
+
+    for _, messages in records.items():
+        for msg in messages:
+            chunks.append(msg.value)
+
+    return chunks
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run local Kafka motor controller."
+    )
+
+    parser.add_argument(
+        "--schedule-apply-mode",
+        choices=["delay_aware", "naive"],
+        default=SCHEDULE_APPLY_MODE,
+        help="How to apply received schedule chunks.",
+    )
+    parser.add_argument(
+        "--disable-schedule-chunk",
+        action="store_true",
+        help="Disable schedule chunk consumption and use legacy/fallback behavior.",
+    )
+    parser.add_argument(
+        "--disable-legacy-gain-command",
+        action="store_true",
+        help="Disable legacy single gain command fallback from the server.",
+    )
+    parser.add_argument(
+        "--sim-time",
+        type=float,
+        default=SIM_TIME,
+        help="Experiment duration in seconds.",
+    )
+    parser.add_argument(
+        "--target-before",
+        type=float,
+        default=TARGET_BEFORE,
+        help="Target before the step change.",
+    )
+    parser.add_argument(
+        "--target-after",
+        type=float,
+        default=TARGET_AFTER,
+        help="Target after the step change.",
+    )
+    parser.add_argument(
+        "--target-change-time",
+        type=float,
+        default=TARGET_CHANGE_TIME,
+        help="Time of target step change in seconds.",
+    )
+    parser.add_argument(
+        "--target-sequence",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated multi-step target profile, e.g. '70,85,100'. "
+            "When set, this overrides --target-before/--target-after."
+        ),
+    )
+    parser.add_argument(
+        "--target-change-times",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated change times for --target-sequence, e.g. '3,6'. "
+            "Count must be one less than the target sequence length."
+        ),
+    )
+    parser.add_argument(
+        "--run-label",
+        type=str,
+        default="",
+        help="Optional label appended to output filenames.",
+    )
+
+    return parser.parse_args()
+
+
+def apply_runtime_args(args):
+    global SIM_TIME
+    global N_STEPS
+    global APPLY_SERVER_SCHEDULE_CHUNK
+    global APPLY_SERVER_GAIN_COMMAND
+    global SCHEDULE_APPLY_MODE
+    global TARGET_BEFORE
+    global TARGET_AFTER
+    global TARGET_CHANGE_TIME
+    global TARGET_SEQUENCE
+    global TARGET_CHANGE_TIMES
+
+    SIM_TIME = float(args.sim_time)
+    N_STEPS = int(SIM_TIME / CONTROL_DT)
+    SCHEDULE_APPLY_MODE = args.schedule_apply_mode
+    TARGET_BEFORE = float(args.target_before)
+    TARGET_AFTER = float(args.target_after)
+    TARGET_CHANGE_TIME = float(args.target_change_time)
+    TARGET_SEQUENCE = []
+    TARGET_CHANGE_TIMES = []
+
+    if args.target_sequence:
+        TARGET_SEQUENCE = parse_float_list(args.target_sequence)
+        TARGET_CHANGE_TIMES = parse_float_list(args.target_change_times)
+
+        if len(TARGET_SEQUENCE) < 2:
+            raise ValueError("--target-sequence must contain at least two targets")
+
+        if len(TARGET_CHANGE_TIMES) != len(TARGET_SEQUENCE) - 1:
+            raise ValueError(
+                "--target-change-times count must be one less than "
+                "--target-sequence count"
+            )
+
+        if any(
+            TARGET_CHANGE_TIMES[i] >= TARGET_CHANGE_TIMES[i + 1]
+            for i in range(len(TARGET_CHANGE_TIMES) - 1)
+        ):
+            raise ValueError("--target-change-times must be strictly increasing")
+
+        TARGET_BEFORE = float(TARGET_SEQUENCE[0])
+        TARGET_AFTER = float(TARGET_SEQUENCE[-1])
+        TARGET_CHANGE_TIME = float(TARGET_CHANGE_TIMES[0])
+
+    if args.disable_schedule_chunk:
+        APPLY_SERVER_SCHEDULE_CHUNK = False
+
+    if args.disable_legacy_gain_command:
+        APPLY_SERVER_GAIN_COMMAND = False
+
+
 # ============================================================
 # Metrics
 # ============================================================
@@ -480,6 +729,32 @@ def compute_dt(time_arr: np.ndarray):
     dt_arr = np.diff(time_arr, prepend=time_arr[0])
     dt_arr[0] = 0.0
     return dt_arr
+
+
+def finite_series_stats(df: pd.DataFrame, column: str, prefix: str) -> dict:
+    if column not in df.columns:
+        return {
+            f"{prefix}_mean": np.nan,
+            f"{prefix}_p50": np.nan,
+            f"{prefix}_p90": np.nan,
+            f"{prefix}_max": np.nan,
+        }
+
+    values = pd.to_numeric(df[column], errors="coerce").dropna().to_numpy(dtype=float)
+    if len(values) == 0:
+        return {
+            f"{prefix}_mean": np.nan,
+            f"{prefix}_p50": np.nan,
+            f"{prefix}_p90": np.nan,
+            f"{prefix}_max": np.nan,
+        }
+
+    return {
+        f"{prefix}_mean": float(np.mean(values)),
+        f"{prefix}_p50": float(np.percentile(values, 50)),
+        f"{prefix}_p90": float(np.percentile(values, 90)),
+        f"{prefix}_max": float(np.max(values)),
+    }
 
 
 def calculate_metrics(df: pd.DataFrame) -> dict:
@@ -503,7 +778,8 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
     final_error = float(abs_error[-1])
     mean_abs_error = float(np.mean(abs_error))
 
-    after_change_mask = time_arr >= TARGET_CHANGE_TIME
+    first_change_time = get_first_target_change_time()
+    after_change_mask = time_arr >= first_change_time
 
     if after_change_mask.any():
         after_change_iae = float(
@@ -543,14 +819,75 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
 
     for idx in after_indices:
         if np.all(np.abs(target[idx:] - current[idx:]) <= tolerance):
-            settling_time_after_change = float(time_arr[idx] - TARGET_CHANGE_TIME)
+            settling_time_after_change = float(time_arr[idx] - first_change_time)
             break
+
+    segment_metrics = {}
+    for segment_target in sorted(set(float(value) for value in target)):
+        segment_mask = np.isclose(target, segment_target)
+        if not segment_mask.any():
+            continue
+
+        label = f"target_{segment_target:g}".replace(".", "p")
+        segment_metrics[f"{label}_IAE"] = float(
+            np.sum(abs_error[segment_mask] * dt_arr[segment_mask])
+        )
+        segment_metrics[f"{label}_mean_abs_error"] = float(
+            np.mean(abs_error[segment_mask])
+        )
+        segment_metrics[f"{label}_max_error"] = float(
+            np.max(abs_error[segment_mask])
+        )
+
+    schedule_df = df[df["schedule_source"] == "schedule_chunk"].copy()
+    latency_metrics = {}
+    latency_metrics.update(
+        finite_series_stats(
+            schedule_df,
+            "schedule_source_to_accept_sec",
+            "latency_source_to_accept_sec",
+        )
+    )
+    latency_metrics.update(
+        finite_series_stats(
+            schedule_df,
+            "schedule_source_to_apply_sec",
+            "latency_source_to_apply_sec",
+        )
+    )
+    latency_metrics.update(
+        finite_series_stats(
+            schedule_df,
+            "schedule_generated_to_accept_sec",
+            "latency_generated_to_accept_sec",
+        )
+    )
+    latency_metrics.update(
+        finite_series_stats(
+            schedule_df,
+            "schedule_generator_duration_sec",
+            "latency_generator_duration_sec",
+        )
+    )
+    latency_metrics.update(
+        finite_series_stats(
+            schedule_df,
+            "schedule_timing_slack_sec",
+            "latency_timing_slack_sec",
+        )
+    )
 
     return {
         "backend": MOTOR_BACKEND,
         "control_dt": CONTROL_DT,
         "target_before": TARGET_BEFORE,
         "target_after": TARGET_AFTER,
+        "target_profile": get_target_profile_label(),
+        "target_change_times": ",".join(
+            f"{change_time:g}" for change_time in TARGET_CHANGE_TIMES
+        )
+        if TARGET_CHANGE_TIMES
+        else f"{TARGET_CHANGE_TIME:g}",
 
         "IAE": iae,
         "mean_abs_error": mean_abs_error,
@@ -576,6 +913,20 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
         "server_gain_applied_count": int(
             (df["gain_update_reason"] == "server_gain_applied").sum()
         ),
+        "schedule_gain_applied_count": int(
+            (df["gain_update_reason"] == "schedule_chunk_gain_applied").sum()
+        ),
+        "schedule_apply_mode": str(df["schedule_apply_mode"].dropna().iloc[-1])
+        if "schedule_apply_mode" in df.columns and not df["schedule_apply_mode"].dropna().empty
+        else "unknown",
+        "schedule_chunk_accepted_count": int(
+            df["schedule_chunk_accept_count"].sum()
+        )
+        if "schedule_chunk_accept_count" in df.columns
+        else 0,
+        "schedule_fallback_count": int(df["schedule_fallback_used"].sum())
+        if "schedule_fallback_used" in df.columns
+        else 0,
         "server_gain_discarded_count": int(df["gain_command_discarded"].sum()),
         "duplicate_gain_discard_count": int(
             (df["gain_command_discard_reason"] == "duplicate_gain_command").sum()
@@ -592,6 +943,8 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
         ),
         "min_kp_scale": float(df["kp_scale"].min()),
         "min_ki_scale": float(df["ki_scale"].min()),
+        **latency_metrics,
+        **segment_metrics,
     }
 
 
@@ -599,7 +952,7 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
 # Main control loop
 # ============================================================
 
-def run_local_kafka_controller():
+def run_local_kafka_controller(run_label: str = ""):
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
     control_pwm_min, control_pwm_max, control_pwm_soft_limit = get_backend_pwm_limits()
@@ -612,13 +965,19 @@ def run_local_kafka_controller():
     print(f"Kafka broker: {KAFKA_BOOTSTRAP_SERVERS}")
     print(f"Publish topic: {TOPIC_MOTOR_STATE}")
     print(f"Consume topic: {TOPIC_GAIN_COMMAND}")
+    print(f"Consume schedule topic: {TOPIC_SCHEDULE_CHUNK}")
     print(f"Motor backend: {MOTOR_BACKEND}")
     print(f"Control DT: {CONTROL_DT}")
-    print(f"Target: {TARGET_BEFORE} -> {TARGET_AFTER} at {TARGET_CHANGE_TIME}s")
+    print(
+        f"Target profile: {get_target_profile_label()} "
+        f"at {TARGET_CHANGE_TIMES if TARGET_CHANGE_TIMES else [TARGET_CHANGE_TIME]}s"
+    )
     print(f"Disturbance: {USE_DISTURBANCE}, mode={DISTURBANCE_MODE}")
     print(f"Control PWM limit: {control_pwm_min} ~ {control_pwm_max}")
     print(f"Control PWM soft limit: {control_pwm_soft_limit}")
     print(f"Apply server gain command: {APPLY_SERVER_GAIN_COMMAND}")
+    print(f"Apply server schedule chunk: {APPLY_SERVER_SCHEDULE_CHUNK}")
+    print(f"Schedule apply mode: {SCHEDULE_APPLY_MODE}")
     print(f"Saturation-aware local safety layer: {USE_SATURATION_AWARE_GAIN}")
     if MOTOR_BACKEND == "esp32":
         print(f"ESP32 PWM rate limit: {ESP32_LOCAL_PWM_RATE_LIMIT}")
@@ -630,6 +989,12 @@ def run_local_kafka_controller():
 
     producer = create_producer()
     command_consumer = create_gain_command_consumer()
+    schedule_consumer = create_schedule_chunk_consumer()
+    schedule_buffer = ScheduleBuffer(
+        run_id=RUN_ID,
+        device_id=DEVICE_ID,
+        max_chunks=SCHEDULE_BUFFER_MAX_CHUNKS,
+    )
 
     motor = create_motor_backend()
 
@@ -677,12 +1042,172 @@ def run_local_kafka_controller():
             target = get_target_at_time(t)
 
             # ------------------------------------------------
+            # Kafka schedule chunk consume
+            # ------------------------------------------------
+
+            schedule_chunk_accept_reason = "none"
+            schedule_chunk_accept_count = 0
+
+            if APPLY_SERVER_SCHEDULE_CHUNK:
+                for chunk in poll_schedule_chunks(schedule_consumer):
+                    accepted, accept_reason = schedule_buffer.add_chunk(
+                        chunk,
+                        accepted_control_time=t,
+                    )
+                    schedule_chunk_accept_reason = accept_reason
+                    if accepted:
+                        schedule_chunk_accept_count += 1
+
+            if SCHEDULE_APPLY_MODE == "delay_aware":
+                schedule_lookup = schedule_buffer.get_item(
+                    control_time=t,
+                    payload_kind=PAYLOAD_KIND_GAIN,
+                )
+            elif SCHEDULE_APPLY_MODE == "naive":
+                schedule_lookup = schedule_buffer.get_item_naive(
+                    control_time=t,
+                    payload_kind=PAYLOAD_KIND_GAIN,
+                )
+            else:
+                raise ValueError(
+                    "SCHEDULE_APPLY_MODE must be 'delay_aware' or 'naive'"
+                )
+
+            schedule_source = "fallback"
+            schedule_chunk_id = ""
+            schedule_chunk_index = -1
+            schedule_discarded_steps = 0
+            schedule_chunk_age_sec = np.nan
+            schedule_source_to_accept_sec = np.nan
+            schedule_source_to_apply_sec = np.nan
+            schedule_generated_to_accept_sec = np.nan
+            schedule_generated_to_apply_sec = np.nan
+            schedule_publish_to_accept_sec = np.nan
+            schedule_generator_duration_sec = np.nan
+            schedule_state_to_generation_sec = np.nan
+            schedule_latency_assumption_sec = np.nan
+            schedule_timing_slack_sec = np.nan
+            schedule_accepted_control_lag_sec = np.nan
+            schedule_model_family = ""
+            schedule_generator_mode = ""
+            schedule_fallback_used = True
+
+            # ------------------------------------------------
             # Control state before applying new PWM
             # ------------------------------------------------
 
             control_current = current
             control_error = target - control_current
             error_derivative = (control_error - prev_error) / CONTROL_DT
+
+            # ------------------------------------------------
+            # Delay-aware schedule gain application
+            # ------------------------------------------------
+
+            gain_update_reason = "none"
+
+            if APPLY_SERVER_SCHEDULE_CHUNK and schedule_lookup.found:
+                schedule_item = schedule_lookup.item
+
+                if all(key in schedule_item for key in ["kp", "ki", "kd"]):
+                    server_kp = float(schedule_item["kp"])
+                    server_ki = float(schedule_item["ki"])
+                    server_kd = float(schedule_item["kd"])
+
+                    if MOTOR_BACKEND == "esp32" and not is_safe_esp32_gain(
+                        server_kp,
+                        server_ki,
+                        server_kd,
+                    ):
+                        schedule_source = "discarded_unsafe_gain"
+                    else:
+                        new_gain = (server_kp, server_ki, server_kd)
+                        base_gain_changed = any(
+                            abs(a - b) > 1e-9
+                            for a, b in zip(new_gain, last_applied_server_gain)
+                        )
+                        base_kp, base_ki, base_kd = new_gain
+                        last_applied_server_target = float(
+                            schedule_item.get("target", target)
+                        )
+                        last_applied_server_gain = new_gain
+                        latest_applied_command_seq = max(
+                            latest_applied_command_seq,
+                            int(schedule_lookup.chunk.get("source_seq", -1)),
+                        )
+
+                        schedule_source = "schedule_chunk"
+                        schedule_chunk_id = str(schedule_lookup.chunk["chunk_id"])
+                        schedule_chunk_index = int(schedule_lookup.chunk_index)
+                        schedule_discarded_steps = int(schedule_lookup.discarded_steps)
+                        schedule_chunk_age_sec = float(schedule_lookup.chunk_age_sec)
+                        chunk = schedule_lookup.chunk
+                        chunk_metadata = dict(chunk.get("metadata", {}))
+                        accepted_at_wall_time = schedule_lookup.accepted_at_wall_time
+                        accepted_at_control_time = (
+                            schedule_lookup.accepted_at_control_time
+                        )
+                        now_wall_time = time.time()
+                        source_timestamp = float(chunk.get("source_timestamp", np.nan))
+                        generated_at = float(chunk.get("generated_at", np.nan))
+                        publish_start = float(
+                            chunk_metadata.get(
+                                "schedule_publish_start_wall_time",
+                                np.nan,
+                            )
+                        )
+                        schedule_generator_duration_sec = float(
+                            chunk_metadata.get("generator_duration_sec", np.nan)
+                        )
+                        schedule_state_to_generation_sec = float(
+                            chunk_metadata.get("state_to_generation_sec", np.nan)
+                        )
+                        schedule_latency_assumption_sec = float(
+                            chunk_metadata.get("latency_assumption_sec", np.nan)
+                        )
+                        schedule_model_family = str(
+                            chunk_metadata.get("model_family", "")
+                        )
+                        schedule_generator_mode = str(
+                            chunk_metadata.get("generator_mode", "")
+                        )
+
+                        if accepted_at_wall_time is not None:
+                            schedule_source_to_accept_sec = (
+                                float(accepted_at_wall_time) - source_timestamp
+                            )
+                            schedule_generated_to_accept_sec = (
+                                float(accepted_at_wall_time) - generated_at
+                            )
+                            schedule_publish_to_accept_sec = (
+                                float(accepted_at_wall_time) - publish_start
+                            )
+
+                        if accepted_at_control_time is not None:
+                            schedule_accepted_control_lag_sec = (
+                                t - float(accepted_at_control_time)
+                            )
+
+                        schedule_source_to_apply_sec = now_wall_time - source_timestamp
+                        schedule_generated_to_apply_sec = now_wall_time - generated_at
+                        schedule_timing_slack_sec = (
+                            float(chunk.get("schedule_start_time", np.nan)) - t
+                        )
+                        schedule_fallback_used = False
+                        gain_update_reason = "schedule_chunk_gain_applied"
+
+                        kp_applied, ki_applied, kd_applied = safety_layer.apply_scale(
+                            base_kp,
+                            base_ki,
+                            base_kd,
+                        )
+                        set_pid_gains_preserving_integral_term(
+                            pid,
+                            kp_applied,
+                            ki_applied,
+                            kd_applied,
+                            preserve_integral_term=base_gain_changed,
+                        )
 
             # ------------------------------------------------
             # PID compute using pre-step current
@@ -729,13 +1254,16 @@ def run_local_kafka_controller():
             # server command updates base gain only
             # ------------------------------------------------
 
-            gain_update_reason = "none"
             gain_command_discarded = False
             gain_command_discard_reason = "none"
 
             command = poll_latest_gain_command(command_consumer)
 
-            if command is not None and APPLY_SERVER_GAIN_COMMAND:
+            if (
+                command is not None
+                and APPLY_SERVER_GAIN_COMMAND
+                and schedule_fallback_used
+            ):
                 valid, reason = is_valid_gain_command(
                     command=command,
                     current_run_id=RUN_ID,
@@ -793,6 +1321,7 @@ def run_local_kafka_controller():
                             )
 
                         else:
+                            old_gain = last_applied_server_gain
                             base_kp, base_ki, base_kd = new_gain
                             last_applied_server_target = server_target
                             last_applied_server_gain = new_gain
@@ -805,7 +1334,16 @@ def run_local_kafka_controller():
                                 base_ki,
                                 base_kd,
                             )
-                            pid.set_gains(kp_applied, ki_applied, kd_applied)
+                            set_pid_gains_preserving_integral_term(
+                                pid,
+                                kp_applied,
+                                ki_applied,
+                                kd_applied,
+                                preserve_integral_term=any(
+                                    abs(a - b) > 1e-9
+                                    for a, b in zip(new_gain, old_gain)
+                                ),
+                            )
 
                             print(
                                 f"[APPLY] t={t:.2f}, seq={latest_seq}, "
@@ -863,6 +1401,18 @@ def run_local_kafka_controller():
                     kp_scale=safety_state["kp_scale"],
                     ki_scale=safety_state["ki_scale"],
                     saturation_active=safety_state["saturation_active"],
+                    control_time=t,
+                    measured_time=t + CONTROL_DT,
+                    dt=CONTROL_DT,
+                    prev_pwm=prev_pwm,
+                    integral=pid_state["integral"],
+                    backend=MOTOR_BACKEND,
+                    encoder=(
+                        motor_state.raw.get("encoder")
+                        if isinstance(motor_state.raw, dict)
+                        and "encoder" in motor_state.raw
+                        else None
+                    ),
                 )
 
                 producer.send(TOPIC_MOTOR_STATE, value=state_message)
@@ -922,6 +1472,29 @@ def run_local_kafka_controller():
                     "gain_command_discarded": gain_command_discarded,
                     "gain_command_discard_reason": gain_command_discard_reason,
                     "latest_applied_command_seq": latest_applied_command_seq,
+
+                    "schedule_source": schedule_source,
+                    "schedule_apply_mode": SCHEDULE_APPLY_MODE,
+                    "schedule_chunk_id": schedule_chunk_id,
+                    "schedule_chunk_index": schedule_chunk_index,
+                    "schedule_discarded_steps": schedule_discarded_steps,
+                    "schedule_chunk_age_sec": schedule_chunk_age_sec,
+                    "schedule_source_to_accept_sec": schedule_source_to_accept_sec,
+                    "schedule_source_to_apply_sec": schedule_source_to_apply_sec,
+                    "schedule_generated_to_accept_sec": schedule_generated_to_accept_sec,
+                    "schedule_generated_to_apply_sec": schedule_generated_to_apply_sec,
+                    "schedule_publish_to_accept_sec": schedule_publish_to_accept_sec,
+                    "schedule_generator_duration_sec": schedule_generator_duration_sec,
+                    "schedule_state_to_generation_sec": schedule_state_to_generation_sec,
+                    "schedule_latency_assumption_sec": schedule_latency_assumption_sec,
+                    "schedule_timing_slack_sec": schedule_timing_slack_sec,
+                    "schedule_accepted_control_lag_sec": schedule_accepted_control_lag_sec,
+                    "schedule_model_family": schedule_model_family,
+                    "schedule_generator_mode": schedule_generator_mode,
+                    "schedule_fallback_used": schedule_fallback_used,
+                    "schedule_chunk_accept_count": schedule_chunk_accept_count,
+                    "schedule_chunk_accept_reason": schedule_chunk_accept_reason,
+                    "schedule_buffer_size": len(schedule_buffer),
                 }
             )
 
@@ -939,6 +1512,8 @@ def run_local_kafka_controller():
                     f"applied=({pid_state['kp']:.3f}, {pid_state['ki']:.3f}), "
                     f"scale=({safety_state['kp_scale']:.3f}, {safety_state['ki_scale']:.3f}), "
                     f"gain_reason={gain_update_reason}, "
+                    f"schedule={schedule_source}, "
+                    f"idx={schedule_chunk_index}, "
                     f"discard={gain_command_discard_reason}, "
                     f"local_reason={local_update_reason}"
                 )
@@ -960,14 +1535,25 @@ def run_local_kafka_controller():
         producer.flush()
         producer.close()
         command_consumer.close()
+        schedule_consumer.close()
 
     result_df = pd.DataFrame(rows)
     metrics = calculate_metrics(result_df)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    log_path = RESULT_DIR / f"local_kafka_controller_log_{MOTOR_BACKEND}_{timestamp}.csv"
-    metric_path = RESULT_DIR / f"local_kafka_controller_metrics_{MOTOR_BACKEND}_{timestamp}.csv"
+    label_parts = [MOTOR_BACKEND, SCHEDULE_APPLY_MODE]
+    if run_label:
+        safe_label = "".join(
+            ch if ch.isalnum() or ch in ["-", "_"] else "_"
+            for ch in str(run_label)
+        )
+        label_parts.append(safe_label)
+
+    file_label = "_".join(label_parts)
+
+    log_path = RESULT_DIR / f"local_kafka_controller_log_{file_label}_{timestamp}.csv"
+    metric_path = RESULT_DIR / f"local_kafka_controller_metrics_{file_label}_{timestamp}.csv"
 
     result_df.to_csv(log_path, index=False, encoding="utf-8-sig")
     pd.DataFrame([metrics]).to_csv(metric_path, index=False, encoding="utf-8-sig")
@@ -981,4 +1567,6 @@ def run_local_kafka_controller():
 
 
 if __name__ == "__main__":
-    run_local_kafka_controller()
+    cli_args = parse_args()
+    apply_runtime_args(cli_args)
+    run_local_kafka_controller(run_label=cli_args.run_label)

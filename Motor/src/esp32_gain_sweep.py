@@ -3,6 +3,7 @@ from pathlib import Path
 from datetime import datetime
 import time
 import itertools
+import argparse
 
 import numpy as np
 import pandas as pd
@@ -66,6 +67,139 @@ SCORE_SATURATION_WEIGHT = 10.0
 # ============================================================
 # Utility
 # ============================================================
+
+def parse_float_list(text: str):
+    if text is None or str(text).strip() == "":
+        return None
+
+    return [
+        float(item.strip())
+        for item in str(text).split(",")
+        if item.strip() != ""
+    ]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run ESP32 real motor PID gain sweep."
+    )
+    parser.add_argument(
+        "--targets",
+        type=str,
+        default="",
+        help="Comma-separated target RPM list, e.g. 30,50,70,100.",
+    )
+    parser.add_argument(
+        "--kp-list",
+        type=str,
+        default="",
+        help="Comma-separated Kp list.",
+    )
+    parser.add_argument(
+        "--ki-list",
+        type=str,
+        default="",
+        help="Comma-separated Ki list.",
+    )
+    parser.add_argument(
+        "--kd-list",
+        type=str,
+        default="",
+        help="Comma-separated Kd list.",
+    )
+    parser.add_argument(
+        "--test-time",
+        type=float,
+        default=ESP32_SWEEP_TEST_TIME,
+        help="Test duration per case in seconds.",
+    )
+    parser.add_argument(
+        "--rest-time",
+        type=float,
+        default=ESP32_SWEEP_REST_TIME,
+        help="Rest duration between cases in seconds.",
+    )
+    parser.add_argument(
+        "--pwm-max",
+        type=float,
+        default=ESP32_SWEEP_PWM_MAX,
+        help="Maximum PWM during sweep.",
+    )
+    parser.add_argument(
+        "--pwm-rate-limit",
+        type=float,
+        default=ESP32_SWEEP_PWM_RATE_LIMIT,
+        help="Maximum PWM change per control step.",
+    )
+    parser.add_argument(
+        "--max-cases",
+        type=int,
+        default=0,
+        help="Limit number of cases for a pilot run. 0 means all cases.",
+    )
+    parser.add_argument(
+        "--run-label",
+        type=str,
+        default="",
+        help="Optional label appended to output filenames.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print planned cases without opening serial or moving the motor.",
+    )
+
+    return parser.parse_args()
+
+
+def apply_runtime_args(args):
+    global ESP32_SWEEP_TEST_TIME
+    global ESP32_SWEEP_REST_TIME
+    global ESP32_SWEEP_PWM_MAX
+    global ESP32_SWEEP_PWM_RATE_LIMIT
+    global N_STEPS
+
+    ESP32_SWEEP_TEST_TIME = float(args.test_time)
+    ESP32_SWEEP_REST_TIME = float(args.rest_time)
+    ESP32_SWEEP_PWM_MAX = float(args.pwm_max)
+    ESP32_SWEEP_PWM_RATE_LIMIT = float(args.pwm_rate_limit)
+    N_STEPS = int(ESP32_SWEEP_TEST_TIME / CONTROL_DT)
+
+
+def build_case_lists(args):
+    target_list = parse_float_list(args.targets)
+    kp_list = parse_float_list(args.kp_list)
+    ki_list = parse_float_list(args.ki_list)
+    kd_list = parse_float_list(args.kd_list)
+
+    if target_list is None:
+        target_list = [float(x) for x in ESP32_SWEEP_TARGET_LIST]
+
+    if kp_list is None:
+        kp_list = [float(x) for x in ESP32_SWEEP_KP_LIST]
+
+    if ki_list is None:
+        ki_list = [float(x) for x in ESP32_SWEEP_KI_LIST]
+
+    if kd_list is None:
+        kd_list = [float(x) for x in ESP32_SWEEP_KD_LIST]
+
+    cases = list(itertools.product(target_list, kp_list, ki_list, kd_list))
+
+    if args.max_cases and args.max_cases > 0:
+        cases = cases[: int(args.max_cases)]
+
+    return target_list, kp_list, ki_list, kd_list, cases
+
+
+def safe_label(text: str):
+    if not text:
+        return ""
+
+    return "".join(
+        ch if ch.isalnum() or ch in ["-", "_"] else "_"
+        for ch in str(text)
+    )
 
 def apply_pwm_rate_limit(pwm_cmd, prev_pwm, rate_limit):
     delta = pwm_cmd - prev_pwm
@@ -444,18 +578,20 @@ def plot_best_summary(metrics_df: pd.DataFrame, best_df: pd.DataFrame, timestamp
 # Main
 # ============================================================
 
-def main():
+def main(args=None):
+    if args is None:
+        args = parse_args()
+
+    apply_runtime_args(args)
+
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    target_list = [float(x) for x in ESP32_SWEEP_TARGET_LIST]
-    kp_list = [float(x) for x in ESP32_SWEEP_KP_LIST]
-    ki_list = [float(x) for x in ESP32_SWEEP_KI_LIST]
-    kd_list = [float(x) for x in ESP32_SWEEP_KD_LIST]
-
-    cases = list(itertools.product(target_list, kp_list, ki_list, kd_list))
+    target_list, kp_list, ki_list, kd_list, cases = build_case_lists(args)
     total_cases = len(cases)
+    label = safe_label(args.run_label)
+    file_suffix = f"_{label}_{timestamp}" if label else f"_{timestamp}"
 
     print("=" * 80)
     print("ESP32 real motor PID gain sweep")
@@ -472,7 +608,18 @@ def main():
     print(f"Rest time per case: {ESP32_SWEEP_REST_TIME} s")
     print(f"PWM limit: {ESP32_SWEEP_PWM_MIN} ~ {ESP32_SWEEP_PWM_MAX}")
     print(f"PWM rate limit: {ESP32_SWEEP_PWM_RATE_LIMIT}")
+    print(f"Max safe RPM: {MAX_SAFE_RPM}")
+    print(f"Max abs error for abort: {MAX_ABS_ERROR_FOR_ABORT}")
     print("=" * 80)
+
+    if args.dry_run:
+        print("Dry run only. Planned cases:")
+        for case_id, (target, kp, ki, kd) in enumerate(cases, start=1):
+            print(
+                f"{case_id:03d}: "
+                f"target={target:.1f}, kp={kp:.3f}, ki={ki:.3f}, kd={kd:.3f}"
+            )
+        return
 
     motor = ESP32MotorInterface(
         port=ESP32_PORT,
@@ -505,12 +652,12 @@ def main():
             # case별 중간 저장
             case_log_path = RESULT_DIR / (
                 f"esp32_gain_sweep_case_{case_id:03d}_"
-                f"target_{target:.0f}_kp_{kp:.2f}_ki_{ki:.2f}_{timestamp}.csv"
+                f"target_{target:.0f}_kp_{kp:.2f}_ki_{ki:.2f}{file_suffix}.csv"
             )
             case_df.to_csv(case_log_path, index=False, encoding="utf-8-sig")
 
             metrics_df_partial = pd.DataFrame(metric_rows)
-            partial_metrics_path = RESULT_DIR / f"esp32_gain_sweep_metrics_partial_{timestamp}.csv"
+            partial_metrics_path = RESULT_DIR / f"esp32_gain_sweep_metrics_partial{file_suffix}.csv"
             metrics_df_partial.to_csv(
                 partial_metrics_path,
                 index=False,
@@ -532,8 +679,8 @@ def main():
 
     metrics_df = pd.DataFrame(metric_rows)
 
-    log_path = RESULT_DIR / f"esp32_gain_sweep_log_{timestamp}.csv"
-    metrics_path = RESULT_DIR / f"esp32_gain_sweep_metrics_{timestamp}.csv"
+    log_path = RESULT_DIR / f"esp32_gain_sweep_log{file_suffix}.csv"
+    metrics_path = RESULT_DIR / f"esp32_gain_sweep_metrics{file_suffix}.csv"
 
     log_df.to_csv(log_path, index=False, encoding="utf-8-sig")
     metrics_df.to_csv(metrics_path, index=False, encoding="utf-8-sig")
@@ -545,7 +692,7 @@ def main():
 
     best_df = select_best_gains(metrics_df)
 
-    best_path = RESULT_DIR / f"esp32_gain_sweep_best_{timestamp}.csv"
+    best_path = RESULT_DIR / f"esp32_gain_sweep_best{file_suffix}.csv"
     best_df.to_csv(best_path, index=False, encoding="utf-8-sig")
 
     print(f"Saved best gains: {best_path}")

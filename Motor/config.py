@@ -123,20 +123,6 @@ SIMULINK_SWEEP_STOP_TIME = 10.0
 # Target-based PID gain database
 # ============================================================
 
-PID_GAIN_DB = {
-    50.0:  {"kp": 4.4, "ki": 6.5, "kd": 0.0},
-    75.0:  {"kp": 4.4, "ki": 6.5, "kd": 0.0},
-    100.0: {"kp": 4.2, "ki": 6.0, "kd": 0.0},
-    125.0: {"kp": 4.0, "ki": 5.0, "kd": 0.0},
-    150.0: {"kp": 4.4, "ki": 4.0, "kd": 0.0},
-    175.0: {"kp": 4.4, "ki": 3.0, "kd": 0.0},
-    200.0: {"kp": 4.4, "ki": 2.5, "kd": 0.0},
-}
-
-# ============================================================
-# Target-based PID gain database
-# ============================================================
-
 USE_GAIN_DB = True
 
 # "nearest" 또는 "linear"
@@ -247,7 +233,9 @@ REAL_PWM_SOFT_LIMIT = 120.0
 ESP32_REAL_PID_GAIN_DB = {
     30.0: {"kp": 1.2000, "ki": 0.7000, "kd": 0.0000},
     50.0: {"kp": 1.2000, "ki": 0.7000, "kd": 0.0000},
-    70.0: {"kp": 1.0000, "ki": 0.7000, "kd": 0.0000},
+    70.0: {"kp": 0.6000, "ki": 1.6000, "kd": 0.0300},
+    85.0: {"kp": 1.0000, "ki": 1.9000, "kd": 0.1000},
+    100.0: {"kp": 1.0000, "ki": 1.6000, "kd": 0.1000},
 }
 
 ESP32_REAL_GAIN_DB_MODE = "linear"
@@ -258,9 +246,9 @@ ESP32_REAL_GAIN_DB_MODE = "linear"
 
 ESP32_SWEEP_TARGET_LIST = [30.0, 50.0, 70.0]
 
-ESP32_SWEEP_KP_LIST = [1.0, 1.2, 1.4]
-ESP32_SWEEP_KI_LIST = [0.4, 0.55, 0.7]
-ESP32_SWEEP_KD_LIST = [0.0]
+ESP32_SWEEP_KP_LIST = [0.6, 0.8, 1.0, 1.2, 1.4]
+ESP32_SWEEP_KI_LIST = [0.7, 1.0, 1.3, 1.6, 1.9, 2.2, 2.5]
+ESP32_SWEEP_KD_LIST = [0.0, 0.03, 0.06, 0.1]
 
 ESP32_SWEEP_TEST_TIME = 20.0
 ESP32_SWEEP_REST_TIME = 2.0
