@@ -79,7 +79,7 @@ FALLBACK_ENABLED = True
 # Serial communication
 # ============================================================
 
-SERIAL_PORT = "COM5"
+SERIAL_PORT = "/dev/ttyUSB0"
 BAUD_RATE = 115200
 SERIAL_TIMEOUT = 2.0
 
@@ -217,14 +217,15 @@ MOTOR_BACKEND = "esp32"  # "simulation" or "esp32"
 # ESP32 serial settings
 # ============================================================
 
-ESP32_PORT = "COM5"
+ESP32_PORT = "/dev/ttyUSB0"
 ESP32_BAUDRATE = 115200
 ESP32_TIMEOUT = 0.2
 
-# Conservative real motor limits for initial test
+# Raised from 140/120: this unit needs ~1.4x the PWM of the original
+# testbed for the same rpm, so 140 put the 95 rpm target at saturation.
 REAL_PWM_MIN = 0.0
-REAL_PWM_MAX = 140.0
-REAL_PWM_SOFT_LIMIT = 120.0
+REAL_PWM_MAX = 200.0
+REAL_PWM_SOFT_LIMIT = 170.0
 
 # ============================================================
 # Real ESP32 motor PID gain DB
@@ -254,6 +255,6 @@ ESP32_SWEEP_TEST_TIME = 20.0
 ESP32_SWEEP_REST_TIME = 2.0
 
 ESP32_SWEEP_PWM_MIN = 0.0
-ESP32_SWEEP_PWM_MAX = 140.0
+ESP32_SWEEP_PWM_MAX = 200.0
 ESP32_SWEEP_PWM_RATE_LIMIT = 20.0
 

@@ -61,6 +61,7 @@ from schedule_generators import (
     DirectPolicyMlpChunkGenerator,
     DirectPolicySequenceMlpChunkGenerator,
     DiffusionUnetGainChunkGenerator,
+    FlowMatchingGainChunkGenerator,
     DbGainChunkGenerator,
     MlpCostChunkGenerator,
     MultiTaskMlpCostChunkGenerator,
@@ -109,6 +110,11 @@ TWO_PHASE_KI_DECAY_SCALE = 1.0
 TWO_PHASE_KD_BOOST_SCALE = 1.0
 DIFFUSION_DDIM_STEPS = 20
 DIFFUSION_SAMPLE_COUNT = 1
+FLOW_MATCHING_MODEL_PATH = ""
+FLOW_STEPS = 2
+FLOW_SOLVER = ""
+TORCH_MODEL_PATH = ""
+TORCH_DEVICE = ""
 SCHEDULE_CHUNK_MESSAGE_LOG_PATH = None
 
 
@@ -165,6 +171,9 @@ def parse_args():
             "direct_policy_sequence_mlp",
             "direct_gain_chunk_policy",
             "diffusion_unet_gain_chunk",
+            "flow_matching_gain_chunk",
+            "torch_diffusion_gain_chunk",
+            "torch_flow_matching_gain_chunk",
         ],
         default=GENERATOR_MODE,
         help="Schedule generator backend.",
@@ -204,6 +213,37 @@ def parse_args():
         type=str,
         default=str(DIFFUSION_UNET_MODEL_PATH),
         help="Path to trained diffusion U-Net gain-chunk metadata.",
+    )
+    parser.add_argument(
+        "--torch-model-path",
+        type=str,
+        default=str(TORCH_MODEL_PATH),
+        help="Path to a PyTorch gain-chunk model payload (train_torch_gain_chunk.py).",
+    )
+    parser.add_argument(
+        "--torch-device",
+        type=str,
+        default=TORCH_DEVICE,
+        help="Torch device, e.g. cpu or cuda. Empty picks cuda when available.",
+    )
+    parser.add_argument(
+        "--flow-matching-model-path",
+        type=str,
+        default=str(FLOW_MATCHING_MODEL_PATH),
+        help="Path to trained flow-matching U-Net gain-chunk metadata.",
+    )
+    parser.add_argument(
+        "--flow-steps",
+        type=int,
+        default=FLOW_STEPS,
+        help="Number of ODE integration steps for flow-matching gain chunks.",
+    )
+    parser.add_argument(
+        "--flow-solver",
+        type=str,
+        default=FLOW_SOLVER,
+        choices=["", "euler", "midpoint", "heun"],
+        help="ODE solver for flow matching. Empty uses the trained default.",
     )
     parser.add_argument(
         "--diffusion-ddim-steps",
@@ -313,6 +353,11 @@ def apply_runtime_args(args):
     global TWO_PHASE_KI_DECAY_SCALE
     global TWO_PHASE_KD_BOOST_SCALE
     global DIFFUSION_DDIM_STEPS
+    global TORCH_MODEL_PATH
+    global TORCH_DEVICE
+    global FLOW_MATCHING_MODEL_PATH
+    global FLOW_STEPS
+    global FLOW_SOLVER
     global DIFFUSION_SAMPLE_COUNT
     global SCHEDULE_CHUNK_MESSAGE_LOG_PATH
     global HISTORY_MAXLEN
@@ -340,6 +385,11 @@ def apply_runtime_args(args):
     TWO_PHASE_KD_BOOST_SCALE = float(args.two_phase_kd_boost_scale)
     DIFFUSION_DDIM_STEPS = int(args.diffusion_ddim_steps)
     DIFFUSION_SAMPLE_COUNT = int(args.diffusion_sample_count)
+    TORCH_MODEL_PATH = args.torch_model_path
+    TORCH_DEVICE = args.torch_device
+    FLOW_MATCHING_MODEL_PATH = args.flow_matching_model_path
+    FLOW_STEPS = int(args.flow_steps)
+    FLOW_SOLVER = str(args.flow_solver)
     HISTORY_MAXLEN = int(args.history_maxlen)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     SCHEDULE_CHUNK_MESSAGE_LOG_PATH = (
@@ -378,6 +428,12 @@ def get_model_family(generator_mode: str) -> str:
         return "tensorflow_direct_gain_chunk_policy"
     if generator_mode == "diffusion_unet_gain_chunk":
         return "tensorflow_diffusion_unet_gain_chunk"
+    if generator_mode == "flow_matching_gain_chunk":
+        return "tensorflow_flow_matching_gain_chunk"
+    if generator_mode == "torch_diffusion_gain_chunk":
+        return "pytorch_diffusion_gain_chunk"
+    if generator_mode == "torch_flow_matching_gain_chunk":
+        return "pytorch_flow_matching_gain_chunk"
     return "gain_db"
 
 
@@ -550,6 +606,21 @@ def create_schedule_generator(backend: str, generator_cache: dict = None):
         model_path_key = DIRECT_POLICY_MLP_MODEL_PATH
     elif GENERATOR_MODE == "direct_gain_chunk_policy":
         model_path_key = GAIN_CHUNK_POLICY_MODEL_PATH
+    elif GENERATOR_MODE in {"torch_diffusion_gain_chunk", "torch_flow_matching_gain_chunk"}:
+        model_path_key = (
+            f"{TORCH_MODEL_PATH}:{TORCH_DEVICE}:"
+            f"ddim{DIFFUSION_DDIM_STEPS}:flow{FLOW_STEPS}:{FLOW_SOLVER}:"
+            f"n{DIFFUSION_SAMPLE_COUNT}"
+        )
+    elif GENERATOR_MODE == "flow_matching_gain_chunk":
+        model_path_key = (
+            f"{FLOW_MATCHING_MODEL_PATH}:"
+            f"flow{FLOW_STEPS}:{FLOW_SOLVER}:n{DIFFUSION_SAMPLE_COUNT}:"
+            f"response{RESPONSE_SURROGATE_MODEL_PATH}:"
+            f"score{RESPONSE_SCORE_MODE}:"
+            f"candidate{DIFFUSION_CANDIDATE_MODE}:"
+            f"seed{DIFFUSION_DETERMINISTIC_SEED}"
+        )
     elif GENERATOR_MODE == "diffusion_unet_gain_chunk":
         model_path_key = (
             f"{DIFFUSION_UNET_MODEL_PATH}:"
@@ -635,6 +706,57 @@ def create_schedule_generator(backend: str, generator_cache: dict = None):
                 model_path=GAIN_CHUNK_POLICY_MODEL_PATH,
                 backend_name="esp32",
                 fallback_generator=db_generator,
+            )
+            if generator_cache is not None:
+                generator_cache[cache_key] = generator
+            return generator
+
+        if GENERATOR_MODE in {
+            "torch_diffusion_gain_chunk",
+            "torch_flow_matching_gain_chunk",
+        }:
+            # imported lazily so the TensorFlow-only modes never require torch
+            from torch_schedule_generators import (
+                TorchDiffusionGainChunkGenerator,
+                TorchFlowMatchingGainChunkGenerator,
+            )
+
+            common = dict(
+                model_path=TORCH_MODEL_PATH,
+                backend_name="esp32",
+                fallback_generator=db_generator,
+                sample_count=DIFFUSION_SAMPLE_COUNT,
+            )
+            if TORCH_DEVICE:
+                common["device"] = TORCH_DEVICE
+
+            if GENERATOR_MODE == "torch_diffusion_gain_chunk":
+                generator = TorchDiffusionGainChunkGenerator(
+                    ddim_steps=DIFFUSION_DDIM_STEPS, **common
+                )
+            else:
+                generator = TorchFlowMatchingGainChunkGenerator(
+                    flow_steps=FLOW_STEPS, flow_solver=FLOW_SOLVER, **common
+                )
+            if generator_cache is not None:
+                generator_cache[cache_key] = generator
+            return generator
+
+        if GENERATOR_MODE == "flow_matching_gain_chunk":
+            generator = FlowMatchingGainChunkGenerator(
+                model_path=FLOW_MATCHING_MODEL_PATH,
+                flow_steps=FLOW_STEPS,
+                flow_solver=FLOW_SOLVER,
+                backend_name="esp32",
+                fallback_generator=db_generator,
+                sample_count=DIFFUSION_SAMPLE_COUNT,
+                response_surrogate_model_path=RESPONSE_SURROGATE_MODEL_PATH,
+                response_score_mode=RESPONSE_SCORE_MODE,
+                diffusion_candidate_mode=DIFFUSION_CANDIDATE_MODE,
+                diffusion_deterministic_seed=DIFFUSION_DETERMINISTIC_SEED,
+                two_phase_boost_scale=TWO_PHASE_BOOST_SCALE,
+                two_phase_ki_decay_scale=TWO_PHASE_KI_DECAY_SCALE,
+                two_phase_kd_boost_scale=TWO_PHASE_KD_BOOST_SCALE,
             )
             if generator_cache is not None:
                 generator_cache[cache_key] = generator

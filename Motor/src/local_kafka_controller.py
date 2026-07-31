@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 try:
-    from kafka import KafkaProducer, KafkaConsumer
+    from kafka import KafkaProducer, KafkaConsumer, TopicPartition
 except ImportError:
     KafkaProducer = None
     KafkaConsumer = None
@@ -517,6 +517,32 @@ def create_producer():
     return producer
 
 
+def _subscribe_latest(consumer, topic: str):
+    """
+    Attach a consumer to every partition of `topic`, positioned at the end.
+
+    Consumer-group subscription is deliberately avoided. With kafka-python 3.0.9
+    against a Kafka 3.9 broker the group join never completes when poll() is
+    called with the very short timeouts this control loop uses, so the consumer
+    is never assigned a partition and silently receives nothing. Manual
+    assignment also removes rebalance pauses, which a real-time loop does not
+    want anyway.
+
+    The priming poll matters: without one, the fetcher has not issued its first
+    request yet and subsequent 1 ms polls return empty forever.
+    """
+    partitions = consumer.partitions_for_topic(topic)
+    if not partitions:
+        raise RuntimeError(
+            f"Topic {topic!r} has no partitions. Is the broker running and the "
+            "topic created?"
+        )
+    consumer.assign([TopicPartition(topic, p) for p in sorted(partitions)])
+    consumer.seek_to_end()
+    consumer.poll(timeout_ms=1)
+    return consumer
+
+
 def create_gain_command_consumer():
     if KafkaConsumer is None:
         raise ImportError(
@@ -525,15 +551,13 @@ def create_gain_command_consumer():
         )
 
     consumer = KafkaConsumer(
-        TOPIC_GAIN_COMMAND,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        group_id=f"{LOCAL_CONTROLLER_GROUP_ID}_{RUN_ID}",
         value_deserializer=json_deserializer,
         auto_offset_reset="latest",
-        enable_auto_commit=True,
+        enable_auto_commit=False,
         consumer_timeout_ms=1,
     )
-    return consumer
+    return _subscribe_latest(consumer, TOPIC_GAIN_COMMAND)
 
 
 def create_schedule_chunk_consumer():
@@ -544,15 +568,13 @@ def create_schedule_chunk_consumer():
         )
 
     consumer = KafkaConsumer(
-        TOPIC_SCHEDULE_CHUNK,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        group_id=f"{LOCAL_CONTROLLER_GROUP_ID}_{RUN_ID}_schedule",
         value_deserializer=json_deserializer,
         auto_offset_reset="latest",
-        enable_auto_commit=True,
+        enable_auto_commit=False,
         consumer_timeout_ms=1,
     )
-    return consumer
+    return _subscribe_latest(consumer, TOPIC_SCHEDULE_CHUNK)
 
 
 def poll_latest_gain_command(consumer):
