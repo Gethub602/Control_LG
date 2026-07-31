@@ -336,14 +336,16 @@ def run_single_case(
     state = motor.get_state()
     current_rpm = state.current
 
-    start_time = time.time()
+    # WSL can correct CLOCK_REALTIME by about one second while a run is active.
+    # Elapsed control time must therefore use a monotonic clock.
+    start_time = time.monotonic()
     aborted = False
     abort_reason = "none"
 
     try:
         for step in range(N_STEPS):
-            loop_start = time.time()
-            t = time.time() - start_time
+            loop_start = time.monotonic()
+            t = time.monotonic() - start_time
 
             target = float(target_rpm)
             error = target - current_rpm
@@ -370,6 +372,7 @@ def run_single_case(
                     "case_id": case_id,
                     "step": step,
                     "time": t,
+                    "wall_time": time.time(),
 
                     "target": target,
                     "rpm": current_rpm,
@@ -413,7 +416,7 @@ def run_single_case(
             prev_error = error
             prev_pwm = pwm_cmd
 
-            elapsed = time.time() - loop_start
+            elapsed = time.monotonic() - loop_start
             sleep_time = max(0.0, CONTROL_DT - elapsed)
             time.sleep(sleep_time)
 

@@ -515,6 +515,7 @@ DEBUG=5 ...                                                   # PTX 어셈블리
 | `src/benchmark_ddim_speedups.py` | DDIM 가속 벤치마크 |
 | `src/tinygrad_overhead_probe.py` | 커널 오버헤드 해부 |
 | `src/summarize_gain_collection.py` | 진행률·균형·시간축 품질·ETA 점검 |
+| `src/run_post_collection_pipeline.py` | 수집 검증 → 게인 스윕 → 호라이즌 재구축 자동 체인 |
 | `PERFORMANCE_REPRO.md` | TF 가속 및 tinygrad VIZ 직접 재현 가이드 |
 
 ### 수정한 기존 파일
@@ -577,8 +578,8 @@ python src/local_kafka_controller.py --schedule-apply-mode delay_aware --sim-tim
 | 작업 | 상태 |
 |---|---|
 | 청크 수집 1000궤적 | 🔄 유효 291 + monotonic 신규 709 진행 중 |
-| 게인 스윕 420 케이스 (~2.6h) | ⏸ |
-| 호라이즌 데이터셋 재구축 | ⏸ 스윕 후 |
+| 게인 스윕 420 케이스 (~2.8h) | ⏳ 수집 완료 후 자동 시작 예약 |
+| 호라이즌 데이터셋 재구축 | ⏳ 스윕 검증 후 자동 실행 예약 |
 | 10개 모델 본 학습 | ⏸ |
 | 실물 폐루프 최종 비교 | ⏸ |
 | tinygrad U-Net 포팅 | ⏸ 선택 |
