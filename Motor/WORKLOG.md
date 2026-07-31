@@ -269,6 +269,29 @@ chunk_labels_sim400_...         's' ← 사전순 뒤라 선택됨
 저장소 스크립트들이 `plt.show()`를 호출하는데 WSL에 디스플레이가 없어
 무한 대기. **`MPLBACKEND=Agg` 필수.**
 
+### 5.5 WSL realtime clock 점프 (치명적)
+
+최초 실물 수집에서 약 33초마다 `time` 열이 1.0~1.2초씩 앞으로 뛰었다.
+시리얼과 제어 루프 p99는 약 13ms라 실제 정지와 맞지 않았고,
+`time.time()`과 `time.monotonic()`을 동시에 측정해 WSL 벽시계 보정임을 확인했다.
+
+```
+monotonic elapsed  3.337s → realtime 누적 +1.022s
+monotonic elapsed 35.819s → realtime 누적 +2.079s
+```
+
+수집기가 경과시간과 목표 전환 판단에 `time.time()`을 쓰고 있어 최초 450개 중
+159개 궤적의 전환 시각이 오염됐다. 다음과 같이 조치했다.
+
+- 모든 경과시간·구간 판단·성능 측정을 `time.monotonic()`으로 변경
+- `wall_time`만 관측용 realtime으로 유지
+- 기존 데이터는 `max(time.diff()) <= 0.2s`인 291개만 보존
+- 부족분 709개를 다른 seed로 재수집
+- `merge_chunk_datasets.py --max-time-gap 0.2` 필터 추가
+
+수정 후 같은 궤적에서 wall time은 1.1873초 점프했지만 monotonic time의 최대
+간격은 0.1002초로 유지되어 수정 효과를 검증했다.
+
 ---
 
 ## 6. DDIM 추론 30배 가속
@@ -491,6 +514,8 @@ DEBUG=5 ...                                                   # PTX 어셈블리
 | `src/torch_schedule_generators.py` | 서버용 PyTorch 생성기 |
 | `src/benchmark_ddim_speedups.py` | DDIM 가속 벤치마크 |
 | `src/tinygrad_overhead_probe.py` | 커널 오버헤드 해부 |
+| `src/summarize_gain_collection.py` | 진행률·균형·시간축 품질·ETA 점검 |
+| `PERFORMANCE_REPRO.md` | TF 가속 및 tinygrad VIZ 직접 재현 가이드 |
 
 ### 수정한 기존 파일
 | 파일 | 변경 |
@@ -551,7 +576,7 @@ python src/local_kafka_controller.py --schedule-apply-mode delay_aware --sim-tim
 
 | 작업 | 상태 |
 |---|---|
-| 청크 수집 1000궤적 | 🔄 진행 중 |
+| 청크 수집 1000궤적 | 🔄 유효 291 + monotonic 신규 709 진행 중 |
 | 게인 스윕 420 케이스 (~2.6h) | ⏸ |
 | 호라이즌 데이터셋 재구축 | ⏸ 스윕 후 |
 | 10개 모델 본 학습 | ⏸ |

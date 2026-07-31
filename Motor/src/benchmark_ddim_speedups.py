@@ -15,8 +15,10 @@ Variants compared here:
   tf_function_xla same, with XLA compilation
   threads        eager, but with TF's intra/inter-op thread counts pinned
 
-Accuracy is checked against the eager path so a speedup that changes the output
-is not mistaken for a win.
+Accuracy is checked with identical observations, static features, and initial
+noise so a speedup that changes the output is not mistaken for a win.  The
+first call is reported separately because graph tracing/XLA compilation is a
+cold-start cost, not steady-state inference latency.
 """
 
 import argparse
@@ -97,14 +99,38 @@ def make_graph_sampler(tf, model, alpha_bars_np, step_indices, horizon, gain_dim
     return sample
 
 
+def eager_sample_fixed_noise(tf, model, obs, static, x0_noise, alpha_bars_np,
+                             step_indices):
+    """Same math as ``make_graph_sampler``, kept in Python for parity checks."""
+    x = x0_noise
+    n = tf.shape(obs)[0]
+    for i, t_idx in enumerate(step_indices):
+        t = tf.fill((n,), tf.constant(int(t_idx), tf.int32))
+        eps = model([x, t, obs, static], training=False)
+        at = float(np.sqrt(max(alpha_bars_np[t_idx], 1e-12)))
+        atc = float(np.sqrt(max(1.0 - alpha_bars_np[t_idx], 1e-12)))
+        x0 = tf.clip_by_value((x - atc * eps) / at, -1.5, 1.5)
+        if i == len(step_indices) - 1:
+            x = x0
+        else:
+            j = step_indices[i + 1]
+            ap = float(np.sqrt(max(alpha_bars_np[j], 1e-12)))
+            apc = float(np.sqrt(max(1.0 - alpha_bars_np[j], 1e-12)))
+            x = ap * x0 + apc * eps
+    return tf.clip_by_value(x, -1.0, 1.0)
+
+
 def timeit(fn, repeats):
-    fn()  # warm up / trace
+    t0 = time.perf_counter()
+    fn()  # warm up / trace / compile
+    cold_start_ms = (time.perf_counter() - t0) * 1000
     lat = []
     for _ in range(repeats):
         t0 = time.perf_counter()
         fn()
         lat.append(time.perf_counter() - t0)
     return {
+        "cold_start_ms": float(cold_start_ms),
         "mean_ms": float(np.mean(lat) * 1000),
         "p50_ms": float(np.percentile(lat, 50) * 1000),
         "p90_ms": float(np.percentile(lat, 90) * 1000),
@@ -146,8 +172,6 @@ def main():
     results["eager (current)"] = timeit(
         lambda: ddim_sample(tf, model, obs, static, args_ns, constants, 1), args.repeats
     )
-    ref = ddim_sample(tf, model, obs, static, args_ns, constants, 1)
-
     # --- 2. whole loop traced into one graph
     fixed_noise = tf.constant(
         rng.normal(size=(1, horizon, gain_dim)).astype(np.float32)
@@ -155,10 +179,21 @@ def main():
     obs_t = tf.constant(obs)
     static_t = tf.constant(static)
 
+    results["eager, fixed noise"] = timeit(
+        lambda: eager_sample_fixed_noise(
+            tf, model, obs_t, static_t, fixed_noise, alpha_bars_np, step_indices
+        ).numpy(),
+        args.repeats,
+    )
+    eager_fixed = eager_sample_fixed_noise(
+        tf, model, obs_t, static_t, fixed_noise, alpha_bars_np, step_indices
+    ).numpy()
+
     g = make_graph_sampler(tf, model, alpha_bars_np, step_indices, horizon, gain_dim)
     results["tf.function"] = timeit(lambda: g(obs_t, static_t, fixed_noise).numpy(),
                                     args.repeats)
 
+    gx = None
     try:
         gx = make_graph_sampler(tf, model, alpha_bars_np, step_indices, horizon,
                                 gain_dim, jit=True)
@@ -179,18 +214,28 @@ def main():
     except RuntimeError as exc:
         print(f"thread pinning unavailable after init: {exc}")
 
-    print(f"{'variant':<24}{'mean ms':>10}{'p50 ms':>10}{'p90 ms':>10}{'speedup':>10}")
-    print("-" * 64)
+    print(f"{'variant':<24}{'cold ms':>11}{'mean ms':>10}{'p50 ms':>10}"
+          f"{'p90 ms':>10}{'speedup':>10}")
+    print("-" * 75)
     base = results["eager (current)"]["p90_ms"]
     for name, r in results.items():
-        print(f"{name:<24}{r['mean_ms']:>10.1f}{r['p50_ms']:>10.1f}"
+        print(f"{name:<24}{r['cold_start_ms']:>11.1f}{r['mean_ms']:>10.1f}{r['p50_ms']:>10.1f}"
               f"{r['p90_ms']:>10.1f}{base / r['p90_ms']:>9.1f}x")
 
-    # sanity: the graph path must produce the same distribution as eager
-    out = g(obs_t, static_t, fixed_noise).numpy()
+    # Numerical parity: all variants receive exactly the same initial noise.
+    graph_out = g(obs_t, static_t, fixed_noise).numpy()
+    graph_err = np.abs(eager_fixed - graph_out)
     print()
-    print(f"eager sample range : [{ref.min():.3f}, {ref.max():.3f}]")
-    print(f"graph sample range : [{out.min():.3f}, {out.max():.3f}]")
+    print("fixed-noise numerical parity against eager:")
+    print(f"  tf.function       max_abs={graph_err.max():.8f} "
+          f"mean_abs={graph_err.mean():.8f} "
+          f"allclose={np.allclose(eager_fixed, graph_out, rtol=1e-5, atol=1e-6)}")
+    if gx is not None:
+        xla_out = gx(obs_t, static_t, fixed_noise).numpy()
+        xla_err = np.abs(eager_fixed - xla_out)
+        print(f"  tf.function + XLA max_abs={xla_err.max():.8f} "
+              f"mean_abs={xla_err.mean():.8f} "
+              f"allclose={np.allclose(eager_fixed, xla_out, rtol=1e-5, atol=1e-6)}")
     return 0
 
 

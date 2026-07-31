@@ -24,6 +24,7 @@ MOTOR_DIR = CURRENT_DIR.parent
 sys.path.append(str(MOTOR_DIR))
 
 PROCESSED_ROOT = MOTOR_DIR / "data" / "processed" / "diffusion_gain_chunk_db"
+RAW_ROOT = MOTOR_DIR / "data" / "raw" / "diffusion_gain_chunk_db"
 
 
 def parse_args():
@@ -36,6 +37,12 @@ def parse_args():
                    help="Skip inputs whose name contains this substring. "
                         "Defaults to 'sim' so simulation data is not mixed in.")
     p.add_argument("--label", default="merged")
+    p.add_argument(
+        "--max-time-gap",
+        type=float,
+        help="Keep only trajectories whose raw time axis has no gap above this many seconds. "
+             "Use 0.2 to reject the pre-monotonic WSL clock jumps.",
+    )
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
@@ -78,6 +85,31 @@ def main():
         frames.append(df)
 
     merged = pd.concat(frames, ignore_index=True)
+
+    if args.max_time_gap is not None:
+        wanted = set(merged["trajectory_id"].astype(str).unique())
+        seen, rejected = set(), set()
+        for raw_path in RAW_ROOT.glob("*/trajectory_*.csv"):
+            # The trajectory id is also inside the CSV; reading only two small
+            # columns avoids loading the wide raw schema during filtering.
+            raw = pd.read_csv(raw_path, usecols=["trajectory_id", "time"])
+            if raw.empty:
+                continue
+            trajectory_id = str(raw["trajectory_id"].iloc[0])
+            if trajectory_id not in wanted:
+                continue
+            seen.add(trajectory_id)
+            dt = raw["time"].astype(float).diff().dropna()
+            if bool((dt > float(args.max_time_gap)).any()):
+                rejected.add(trajectory_id)
+        missing = wanted - seen
+        if missing:
+            print(f"Missing raw trajectory files for {len(missing)} ids; refusing to guess.")
+            return 1
+        before = len(merged)
+        merged = merged[~merged["trajectory_id"].astype(str).isin(rejected)].reset_index(drop=True)
+        print(f"clock-gap filter   : rejected {len(rejected)} trajectories, "
+              f"{before - len(merged)} chunk rows (threshold={args.max_time_gap}s)")
 
     dupes = merged["sample_id"].duplicated().sum() if "sample_id" in merged else 0
     if dupes:

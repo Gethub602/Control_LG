@@ -346,12 +346,15 @@ def run_trajectory(motor, scenario: dict, args, trajectory_id: str):
     prev_pwm = 0.0
     aborted = False
     abort_reason = "none"
-    start_wall_time = time.time()
+    # WSL's realtime clock can jump forward when it synchronizes with the
+    # Windows host.  Use a monotonic clock for every elapsed-time decision so
+    # target transitions and 10 Hz sample timestamps cannot jump with it.
+    start_monotonic = time.monotonic()
 
     try:
         for step in range(n_steps):
-            loop_start = time.time()
-            t = time.time() - start_wall_time
+            loop_start = time.monotonic()
+            t = time.monotonic() - start_monotonic
             target, segment_idx = get_target_at(t, scenario)
             transition = target_change_context(t, scenario, segment_idx)
             gain = get_gain_at(t, scenario, target, segment_idx)
@@ -365,15 +368,15 @@ def run_trajectory(motor, scenario: dict, args, trajectory_id: str):
             pid_p_term = float(gain["kp"] * error)
             pid_i_term = float(gain["ki"] * tentative_integral)
             pid_d_term = float(gain["kd"] * error_derivative)
-            compute_start = time.time()
+            compute_start = time.monotonic()
             raw_pwm = pid.compute(target, current_rpm)
-            compute_elapsed_sec = time.time() - compute_start
+            compute_elapsed_sec = time.monotonic() - compute_start
             pwm = apply_pwm_rate_limit(raw_pwm, prev_pwm, float(args.pwm_rate_limit))
             pwm = float(np.clip(pwm, REAL_PWM_MIN, float(args.pwm_max)))
 
-            motor_step_start = time.time()
+            motor_step_start = time.monotonic()
             state = motor.step(pwm)
-            motor_step_elapsed_sec = time.time() - motor_step_start
+            motor_step_elapsed_sec = time.monotonic() - motor_step_start
             current_rpm = float(state.current)
             measured_error_post = float(target - current_rpm)
             encoder = np.nan
@@ -383,7 +386,7 @@ def run_trajectory(motor, scenario: dict, args, trajectory_id: str):
                 esp32_reported_pwm = state.raw.get("pwm", np.nan)
 
             pid_state = pid.get_state()
-            loop_elapsed_sec = time.time() - loop_start
+            loop_elapsed_sec = time.monotonic() - loop_start
             sleep_time = max(0.0, CONTROL_DT - loop_elapsed_sec)
             rows.append(
                 {
@@ -592,6 +595,8 @@ def main():
         "run_label": label,
         "args": vars(args),
         "control_dt": CONTROL_DT,
+        "elapsed_clock": "time.monotonic",
+        "wall_clock": "time.time",
         "esp32_port": ESP32_PORT,
         "esp32_baudrate": ESP32_BAUDRATE,
         "esp32_timeout": ESP32_TIMEOUT,
@@ -698,6 +703,8 @@ def main():
 
     schema = {
         "control_dt": CONTROL_DT,
+        "elapsed_clock": "time.monotonic",
+        "wall_clock": "time.time",
         "v1_policy_feature_cols": V1_POLICY_FEATURE_COLS,
         "sequence_raw_cols": SEQUENCE_RAW_COLS,
         "safe_gain_bounds": SAFE_GAIN_BOUNDS,

@@ -39,6 +39,7 @@ Motor/results/
 Motor/data/raw/
 Motor/data/processed/
 Motor/data/simulation/
+Motor/artifacts/tinygrad_viz/
 
 # Keep folder structure if needed
 !Motor/data/

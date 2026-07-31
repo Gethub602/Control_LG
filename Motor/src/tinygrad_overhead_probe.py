@@ -13,9 +13,11 @@ Run plainly for the timing comparison:
 
     python src/tinygrad_overhead_probe.py
 
-Run with DEBUG=2 to see each kernel, or GRAPH=1 (needs graphviz) for the graph:
+Run with DEBUG=2 to see each kernel, or VIZ=1 for tinygrad's profiler and
+rewrite visualizer:
 
     DEBUG=2 python src/tinygrad_overhead_probe.py --steps 3 --skip-timing
+    VIZ=1 python src/tinygrad_overhead_probe.py --steps 3 --skip-timing
 """
 
 import argparse
@@ -85,7 +87,13 @@ def main():
     x0 = Tensor.randn(1, args.width)
 
     if args.skip_timing:
-        # one pass only, so DEBUG output stays readable
+        # Realize parameters first.  DEBUG=2 output after the marker therefore
+        # shows only the steady-state sampler kernels: two per sequential step.
+        block.w1.realize()
+        block.w2.realize()
+        block.b.realize()
+        x0.realize()
+        print("=== STEADY SAMPLER PASS ===")
         sequential(block, x0, args.steps).realize()
         return 0
 
@@ -109,6 +117,9 @@ def main():
     print(f"speedup: {eager_mean / jit_mean:.1f}x")
     print(f"overhead removed per step: "
           f"{(eager_mean - jit_mean) / args.steps * 1e6:.1f} us")
+    eager_out = sequential(block, x0, args.steps).numpy()
+    jit_out = jitted(x0).numpy()
+    print(f"max |eager - TinyJit|: {np.max(np.abs(eager_out - jit_out)):.8g}")
     print()
     print("The per-step arithmetic is identical in both rows, so the difference")
     print("is what the JIT removed: Python dispatch, graph rebuild and per-kernel")
