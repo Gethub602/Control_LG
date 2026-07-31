@@ -52,6 +52,18 @@ python src/merge_chunk_datasets.py <old_chunks.csv> <new_chunks.csv> \
 
 ## 3. 실제 TF DDIM20 가속 재현
 
+먼저 현재 Python이 conda 내부 패키지만 읽는지 확인한다.
+
+```bash
+conda activate lgcontrol
+PYTHONNOUSERSITE=1 python -c \
+  'import numpy, google.protobuf, tensorflow as tf; print(numpy.__version__, google.protobuf.__version__, tf.__version__)'
+```
+
+이 장비의 정상 조합은 `1.26.4 4.25.9 2.15.1`이다. `_ARRAY_API`,
+`GetPrototype`, `np.complex_` 오류가 나오거나 아래 결과 표가 출력되지 않으면
+벤치마크가 느린 것이 아니라 TensorFlow import 전에 실패한 것이므로 측정값이 없다.
+
 ```bash
 conda activate lgcontrol
 PYTHONNOUSERSITE=1 python src/benchmark_ddim_speedups.py \
