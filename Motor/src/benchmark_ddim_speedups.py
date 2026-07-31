@@ -139,6 +139,19 @@ def timeit(fn, repeats):
 
 def main():
     args = parse_args()
+
+    # TensorFlow 2.15 is built against NumPy 1.x.  A user-site NumPy/protobuf
+    # can silently shadow the compatible conda packages and fail much later
+    # during TF import with _ARRAY_API/GetPrototype errors.
+    numpy_path = Path(np.__file__).resolve()
+    env_prefix = Path(sys.prefix).resolve()
+    if not numpy_path.is_relative_to(env_prefix):
+        print("ERROR: NumPy is being imported from outside the active conda environment:")
+        print(f"  {numpy_path}")
+        print("Re-run with user-site packages disabled:")
+        print("  PYTHONNOUSERSITE=1 python src/benchmark_ddim_speedups.py ...")
+        return 2
+
     payload = joblib.load(args.model_path)
 
     from train_diffusion_gain_chunk_unet import configure_tensorflow, ddim_sample

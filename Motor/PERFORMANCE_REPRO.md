@@ -54,7 +54,7 @@ python src/merge_chunk_datasets.py <old_chunks.csv> <new_chunks.csv> \
 
 ```bash
 conda activate lgcontrol
-python src/benchmark_ddim_speedups.py \
+PYTHONNOUSERSITE=1 python src/benchmark_ddim_speedups.py \
   --model-path artifacts/final_ddim20/models/diffusion_gain_chunk_unet_balanced1000_global_topk_full_20260508_193250_linux.joblib \
   --ddim-steps 20 --repeats 15
 ```
